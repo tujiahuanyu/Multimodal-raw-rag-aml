@@ -104,5 +104,50 @@ async def test_full_evaluation_requires_quota_confirmation(tmp_path):
     )
     with pytest.raises(ValueError, match='quota'):
         await full_run.execute(arguments)
-    status = json.loads((arguments.output / 'job_status.json').read_text())
+    status = json.loads((arguments.output / 'evaluation_job_status.json').read_text())
     assert status['state'] == 'failed_or_interrupted'
+
+
+@pytest.mark.asyncio
+async def test_local_qwen_does_not_use_http_or_double_format(monkeypatch):
+    adapter = object.__new__(MultimodalRAGAdapter)
+    adapter.config = {'rerank': {'provider': 'local_qwen3', 'model_path': '/test-only'}}
+    calls = []
+
+    class Local:
+        def __init__(self, options):
+            calls.append(options)
+
+        def rank(self, query, candidates, limit):
+            calls.append((query, candidates, limit))
+            return [{**candidates[0], 'rerank_score': 0.9}]
+
+    monkeypatch.setattr(
+        'evaluation.src.multimodal.local_reranker.LocalQwenReranker', Local
+    )
+    candidates = [{'content': 'Paris is in France.'}]
+    ranked = await adapter._rerank_candidates(
+        'France?', candidates, 1, 'scenario', 'question'
+    )
+    assert ranked[0]['rerank_score'] == 0.9
+    assert calls[1] == ('France?', candidates, 1)
+
+
+@pytest.mark.asyncio
+async def test_local_evaluation_does_not_require_paid_cohere(tmp_path, monkeypatch):
+    arguments = argparse.Namespace(
+        env_file=tmp_path / 'missing.env',
+        output=tmp_path / 'output',
+        stage='evaluate',
+        data_root=tmp_path,
+        config='local.yaml',
+        caption_workers=1,
+        confirm_full_rerank_quota=False,
+    )
+    monkeypatch.setattr(
+        runner, '_load_config', lambda path: {'rerank': {'provider': 'local_qwen3'}}
+    )
+    run = AsyncMock()
+    monkeypatch.setattr(runner, 'run', run)
+    await full_run.execute(arguments)
+    run.assert_awaited_once()

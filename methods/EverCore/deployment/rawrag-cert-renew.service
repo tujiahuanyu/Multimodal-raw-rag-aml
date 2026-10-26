@@ -5,4 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+Environment=HTTP_PROXY=http://127.0.0.1:47897
+Environment=HTTPS_PROXY=http://127.0.0.1:47897
+Environment=NO_PROXY=127.0.0.1,localhost
 ExecStart=/opt/rawrag-aml/certbot-venv/bin/certbot renew --quiet --deploy-hook "/usr/bin/systemctl reload nginx"

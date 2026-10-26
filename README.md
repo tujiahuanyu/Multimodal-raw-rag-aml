@@ -10,6 +10,7 @@
 - 图片经视觉模型生成描述，描述与原始会话文字共同用于检索。
 - 文本向量召回后重排，返回来源文字和原始图片；当前没有直接图片向量检索分支。
 - 默认学术配置使用 `gpt-4o-mini`、`text-embedding-v4`、`rerank-v3.5`。
+- 离线全量研究另提供 `Qwen3-Reranker-4B` 单 GPU 配置，不改变默认云端服务模型。
 - 256-token 窗口、32-token 重叠、最多召回 128 个候选、重排返回最多 15 条。
 - AML 服务只完成 Add/Search，不在 Search 中生成最终答案。
 - MemGallery 离线研究流程另带 Reader 及诊断 EM/F1，不能混同为赛事统一 Answer/Eval。
@@ -21,6 +22,7 @@
 3. SQLite 持久化 Add/Search 服务、用户隔离、幂等写入、认证及媒体限制。
 4. 可选重排专用代理，不要求将其他上游 API 全局代理。
 5. 小样例测试、可续跑的全量图片预处理、部署配置与接口说明。
+6. 本地 Qwen3-Reranker-4B 重排、下载后实际推理检查，以及等待预处理完成的全量评测入口。
 
 ## 安装和启动
 
@@ -115,6 +117,37 @@ python -m evaluation.src.multimodal.full_run --stage evaluate \
 ```
 
 不要在没有额度时使用确认标志，也不要通过轮换账号绕过限制。
+
+### 本地 Qwen4B 重排
+
+此配置用于有 CUDA GPU 的研究服务器，不适用于 2 核 4GB 的 CPU 云服务器。
+当前实现使用 BF16、SDPA、每批 4 个候选，在本地对候选文本进行 yes/no 相关性打分，
+不调用 Cohere，也不会在失败时退回 Cohere。图片仍经视觉描述参与文本召回和重排，
+这不是原生多模态重排。视觉描述、向量生成和 Reader 仍调用各自外部 API，可能产生费用。
+
+```bash
+pip install -r requirements-local-reranker.txt
+export QWEN_RERANK_MODEL_PATH=/absolute/path/to/models/Qwen3-Reranker-4B
+CUDA_VISIBLE_DEVICES=0 python -m evaluation.src.multimodal.download_reranker \
+  --output "$QWEN_RERANK_MODEL_PATH"
+```
+
+下载器从官方 ModelScope 模型仓库获取安全权重及分词器文件，不执行远程模型代码。
+只有实际加载并通过中英文排序检查及 128 候选检查后，才生成 `load_test_passed.json`。
+将相同 `QWEN_RERANK_MODEL_PATH` 写入私有 `.env.aml`，在图片预处理完成后运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m evaluation.src.multimodal.full_run --stage evaluate \
+  --data-root /absolute/path/to/Mem-Gallery --env-file .env.aml \
+  --config evaluation/config/systems/memgallery_local_qwen4b.yaml \
+  --output /absolute/path/to/run --wait-for-prerequisites
+```
+
+等待模式最多等待 12 小时，检查全部图片描述缓存及模型验证标记；同一输出目录中的
+`captions.pid`、`reranker-download.pid` 可用于检查前置后台任务是否提前停止。
+每题结果写入 `evaluation/results.jsonl`，汇总为 `evaluation/summary.json`，相同配置可续跑。
+超长重排输入明确报错，不静默截断。此配置与 Cohere 配置是不同实验，比较时需注明。
+
 Reader 每题最多 10 张图片，优先保留全部查询图；其余历史图预算及截断计数写入结果。
 离线读取图片的体积限制与比赛 API 不同：研究流程最多 20 MiB，API 最多 10 MiB。
 EM/F1 和来源轮次召回仅为诊断指标，不是官方 LLM 评审结果。
@@ -125,6 +158,10 @@ EM/F1 和来源轮次召回仅为诊断指标，不是官方 LLM 评审结果。
 （含图片查询），来源证据召回分别为 100%、100%、50%。这不代表全部答对或全集成绩。
 同一快照在云端检索复测一致；全新图片 Add/Search、未认证拒绝、用户隔离、
 服务重启后持久化检查通过。全量结果尚未完成，不将运行中任务写成完成成绩。
+公网可信 HTTPS 的图片 Add、文字 Search、图片 Search、未认证拒绝和用户隔离检查通过；
+IP 证书的模拟续期通过。这些是自测，不是赛事平台签发的正式 smoke 或评分结果。
+独立导出的公开源码通过 124 项测试。在单张 RTX 3090 上，Qwen4B 的中英文排序检查通过；
+128 个合成候选重排耗时 3.62 秒，峰值已分配显存约 7.6 GiB。这不是全集速度或效果保证。
 
 ## 测试
 
@@ -142,3 +179,4 @@ python -m pytest tests/test_aml_api.py tests/test_aml_smoke.py -q
 - AML 接口契约：https://agentmemoryleaderboard.ai/api-guide
 - Cohere 调用限制：https://docs.cohere.com/docs/rate-limits
 - MemGallery：https://huggingface.co/datasets/Ethan-Bei/Mem-Gallery
+- Qwen3-Reranker-4B：https://huggingface.co/Qwen/Qwen3-Reranker-4B
