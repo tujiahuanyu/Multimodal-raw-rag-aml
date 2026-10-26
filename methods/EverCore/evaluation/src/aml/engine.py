@@ -214,11 +214,11 @@ class Engine:
 
     async def search(self, request):
         async with self.locks.setdefault(request.user_id, asyncio.Lock()):
-            if request.top_k == 0 or not self.store.has_user(request.user_id):
-                return {'data': []}
             content, images, size = self._normalize(request.query)
             if size > self.settings.max_media_bytes:
                 raise ServiceError(413, 'query_media_exceeds_30_mib')
+            if request.top_k == 0 or not self.store.has_user(request.user_id):
+                return {'data': []}
             text = (
                 content
                 if isinstance(content, str)

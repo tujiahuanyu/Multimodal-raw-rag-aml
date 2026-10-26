@@ -3,6 +3,7 @@
 核对日期：2026-10-26。
 官方依据：https://agentmemoryleaderboard.ai/api-guide 。
 本服务实现同步 Add/Search，Search 不生成最终答案；Answer/Eval 由平台完成。
+本轮实际结果与未完成项见 [2026-10-26 复查记录](AML_AUDIT_20261026_ZH.md)。
 
 | 官方要求 | 服务实现 |
 | --- | --- |
@@ -20,9 +21,47 @@
 | 接口使用认证，健康检查无需认证 | 支持 Authorization: Token/Bearer 和 X-Api-Key；GET /health 无需认证 |
 | 单次最长 30 分钟 | 服务同步处理，部署时的入口代理也必须允许足够的请求时间 |
 
-正式参赛还要求可公网访问的接口、固定版本及公开仓库材料。
-云端仅回环监听的测试服务不等于已具备公开提交条件，需再配置 HTTPS 入口及安全组。
-不要通过公网明文 HTTP 传输真实 Key 或评测记忆。
+云端已配置可信公网 IP HTTPS 入口、安全组及证书自动续期；内部 API 和重排代理
+仍仅回环监听。不要通过公网明文 HTTP 传输真实 Key 或评测记忆。
+
+## 官方样例回归
+
+`evaluation/config/aml_official_examples.json` 记录官方契约正文和接入指南中的两组文字
+Add/Search 样例，以及一组多模态 Add/Search 样例。保留原始字段、标识和 options。
+官方图片 Base64 使用不可执行的省略占位符，测试仅将这些占位符替换为生成的有效
+JPEG/PNG，不能声称没有任何替换就直接发送了原始图片字符串。
+
+本机接口回归使用替身模型，不产生真实 API 费用：
+
+```bash
+python -m pytest tests/test_aml_api.py tests/test_aml_smoke.py tests/test_aml_contract_validation.py -q
+```
+
+对已经部署的真实 HTTPS 服务进行样例自测：
+
+```bash
+python -m evaluation.src.aml.contract_smoke \
+  --base-url https://YOUR_PUBLIC_ENDPOINT \
+  --env-file .env.aml --output /private/path/official-example-report.json
+```
+
+该命令会产生少量真实图片描述、向量和重排调用。它检查响应结构、标识回显、立即可检索、
+幂等重放、冲突、来源内容、图文顺序、稳定 ID、Top K、三种鉴权、空用户和非法输入。
+报告不保存 Key、请求正文或返回证据。默认检索间隔 6.2 秒，不改变服务器并发配置。
+这是参赛方运行的“官方文档样例自测”，不是主办方签发的正式 Smoke 或 Answer/Eval。
+
+本轮修复：即使 user_id 尚无记忆或 top_k=0，也先校验查询内容，非法图片和空白查询
+返回 422，而不是悄悄返回成功空结果。来源与方法改动见 [披露说明](METHOD_DISCLOSURE_ZH.md)。
+
+## 仍需完成的运营与平台条件
+
+- 云端 Cohere 仍依赖电脑代理；自动重连不等于独立、无人值守的网络出口。
+- Trial 调用额度及完整赛道的存储、并发、流量预算仍需保障，未完成长期容量压测。
+- 需取得平台 Eval Key 后运行正式 Smoke；自测不能替代主办方校验。
+- 正式任务结束后 30 天内，必须清理记忆、派生缓存和所有备份副本。当前提供停服后的
+  `purge-user` 命令，但没有平台任务结束回调或自动到期清理，不得把它描述成已自动完成。
+- 需核对上游模型服务提供方的数据处理条款；本轮代码检查只确认调用配置和接口行为，
+  不能独立证明第三方服务实际模型权重或数据留存行为。
 
 ## MemGallery 检查范围
 

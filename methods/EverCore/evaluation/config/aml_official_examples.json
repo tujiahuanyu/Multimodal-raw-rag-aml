@@ -1,0 +1,62 @@
+{
+  "source": "https://agentmemoryleaderboard.ai/api-guide",
+  "reviewed_on": "2026-10-26",
+  "media_substitution": "Only the documentation's incomplete Base64 image placeholders are replaced with generated images. Other example fields remain unchanged.",
+  "cases": [
+    {
+      "name": "contract_text",
+      "add": {
+        "request_id": "eval:run_abc123:locomo_refined:conv-0:chunk-0",
+        "messages": [{"role": "user", "timestamp": 1704067200000, "content": "memory text"}],
+        "user_id": "eval:run_abc123:locomo:conv-0",
+        "session_id": "eval:run_abc123:sample:0"
+      },
+      "search": {
+        "query": "Which answer best matches the memory?",
+        "options": ["A. First answer", "B. Second answer"],
+        "user_id": "eval:run_abc123:locomo:conv-0",
+        "top_k": 100
+      }
+    },
+    {
+      "name": "guide_text",
+      "add": {
+        "request_id": "eval:<run_id>:locomo_refined:conv-0:chunk-0",
+        "messages": [{"role": "user", "timestamp": 1704067200000, "content": "raw memory text"}],
+        "user_id": "eval:<run_id>:locomo:conv-0",
+        "session_id": "eval:<run_id>:sample:0"
+      },
+      "search": {
+        "query": "Which answer best matches the memory?",
+        "options": ["A. First answer", "B. Second answer"],
+        "user_id": "eval:<run_id>:locomo:conv-0",
+        "top_k": 100
+      }
+    },
+    {
+      "name": "guide_multimodal",
+      "add": {
+        "request_id": "eval:<run_id>:multimodal:conv-0:chunk-0",
+        "messages": [{
+          "role": "user",
+          "timestamp": 1704067200000,
+          "content": [
+            {"type": "text", "text": "caption or text evidence"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+          ]
+        }],
+        "user_id": "eval:<run_id>:multimodal:conv-0",
+        "session_id": "eval:<run_id>:sample:0"
+      },
+      "search": {
+        "query": [
+          {"type": "text", "text": "Which answer matches this image?"},
+          {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}
+        ],
+        "options": ["A. First answer", "B. Second answer"],
+        "user_id": "eval:<run_id>:multimodal:conv-0",
+        "top_k": 100
+      }
+    }
+  ]
+}

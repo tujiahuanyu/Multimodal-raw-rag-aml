@@ -542,3 +542,106 @@ async def test_no_explicit_proxy_reuses_default_client(settings):
     provider = Providers(settings)
     assert provider.rerank_client is provider.client
     await provider.close()
+
+
+def test_official_document_examples_end_to_end(client, settings):
+    from evaluation.src.aml.contract_smoke import run
+
+    client.headers.pop('Authorization')
+    report = {}
+    run(client, settings.api_token, report, pause_seconds=0)
+    assert report['passed']
+    assert all(row['passed'] for row in report['checks'])
+
+
+@pytest.mark.parametrize('top_k', [0, 100])
+@pytest.mark.parametrize(
+    'query', ['   ', [image_part('https://example.com/image.png')]]
+)
+def test_invalid_search_is_rejected_even_without_results(client, backend, top_k, query):
+    response = client.post(
+        '/v1/memories/search',
+        json={'user_id': 'unknown-user', 'query': query, 'top_k': top_k},
+    )
+    assert response.status_code == 422
+    assert not backend.embedding_inputs
+    assert not backend.caption_inputs
+
+
+@pytest.mark.parametrize('image_format', ['JPEG', 'PNG', 'WEBP'])
+def test_supported_image_formats_preserve_original_bytes(client, image_format):
+    content = [image_part(image_url(image_format=image_format))]
+    assert (
+        client.post('/v1/memories/add', json=add_payload(content=content)).status_code
+        == 200
+    )
+    result = client.post('/v1/memories/search', json=search_payload()).json()['data'][
+        0
+    ]['content']
+    assert result[1:] == content
+
+
+@pytest.mark.parametrize('delta,status', [(0, 200), (-1, 413)])
+def test_decoded_image_byte_limit_is_exact(settings, delta, status):
+    url = image_url()
+    size = len(base64.b64decode(url.split(',', 1)[1]))
+    bounded = replace(settings, max_image_bytes=size + delta)
+    backend = FakeProviders()
+    with TestClient(create_app(bounded, backend)) as client:
+        client.headers['Authorization'] = 'Token ' + settings.api_token
+        response = client.post(
+            '/v1/memories/add', json=add_payload(content=[image_part(url)])
+        )
+        assert response.status_code == status
+
+
+def test_search_media_budget_preserves_complete_candidates(settings):
+    url = image_url()
+    size = len(base64.b64decode(url.split(',', 1)[1]))
+    bounded = replace(settings, max_media_bytes=size)
+    with TestClient(create_app(bounded, FakeProviders())) as client:
+        client.headers['Authorization'] = 'Token ' + settings.api_token
+        for session in ['first', 'second']:
+            response = client.post(
+                '/v1/memories/add',
+                json=add_payload(
+                    request=session, session=session, content=[image_part(url)]
+                ),
+            )
+            assert response.status_code == 200
+        response = client.post('/v1/memories/search', json=search_payload())
+        assert response.status_code == 200
+        assert len(response.json()['data']) == 1
+        assert response.json()['data'][0]['content'][1:] == [image_part(url)]
+
+
+def test_over_capacity_returns_retry_after(settings):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    backend = FakeProviders()
+    original = backend.embed
+
+    async def delayed(texts):
+        await asyncio.sleep(0.3)
+        return await original(texts)
+
+    backend.embed = delayed
+    barrier = Barrier(3)
+    with TestClient(create_app(settings, backend)) as client:
+        client.headers['Authorization'] = 'Token ' + settings.api_token
+
+        def send(position):
+            barrier.wait(timeout=5)
+            return client.post('/v1/memories/add', json=add_payload(user=str(position)))
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            responses = list(executor.map(send, range(3)))
+        assert sorted(response.status_code for response in responses) == [200, 200, 429]
+        assert (
+            next(
+                response for response in responses if response.status_code == 429
+            ).headers['Retry-After']
+            == '1'
+        )

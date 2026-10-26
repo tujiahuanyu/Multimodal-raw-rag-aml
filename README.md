@@ -4,6 +4,7 @@
 本仓库派生自 [Litmeb/RAW-RAG](https://github.com/Litmeb/RAW-RAG)，上游基线提交为
 `95639191e9547219b426710e50fe1a36235e26fc`，保留原项目 LICENSE。
 原方法与论文作者归上游项目所有；本仓库并非原作者官方发布的比赛服务。
+原作者、论文及逐项方法改动见 [来源披露](methods/EverCore/evaluation/docs/METHOD_DISCLOSURE_ZH.md)。
 
 ## 方法
 
@@ -92,3 +93,5 @@ chmod 600 .env.aml
 pip install pytest pytest-asyncio
 python -m pytest tests/test_aml_api.py tests/test_aml_smoke.py -q
 ```
+
+官方文档样例自测与已知缺口见 [接入复查记录](methods/EverCore/evaluation/docs/AML_AUDIT_20261026_ZH.md)；自测不等于平台正式 Smoke。
