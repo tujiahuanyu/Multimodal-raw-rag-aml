@@ -1,33 +1,22 @@
 # Multimodal Raw-RAG AML
 
-面向 Agent Memory Leaderboard Add/Search 契约的多模态 Raw-RAG 适配。
-本仓库派生自 [Litmeb/RAW-RAG](https://github.com/Litmeb/RAW-RAG)，上游基线提交为
+面向 Agent Memory Leaderboard 的多模态记忆写入与检索服务。
+基于 [Litmeb/RAW-RAG](https://github.com/Litmeb/RAW-RAG)，上游提交为
 `95639191e9547219b426710e50fe1a36235e26fc`，保留原项目 LICENSE。
-原方法与论文作者归上游项目所有；本仓库并非原作者官方发布的比赛服务。
+本仓库为适配版本，非原作者官方比赛服务。
 
-## 方法与边界
+## 方法
 
-- 图片经视觉模型生成描述，描述与原始会话文字共同用于检索。
-- 文本向量召回后重排，返回来源文字和原始图片；当前没有直接图片向量检索分支。
-- 默认学术配置使用 `gpt-4o-mini`、`text-embedding-v4`、`rerank-v3.5`。
-- 离线全量研究另提供 `Qwen3-Reranker-4B` 单 GPU 配置，不改变默认云端服务模型。
-- 256-token 窗口、32-token 重叠、最多召回 128 个候选、重排返回最多 15 条。
-- AML 服务只完成 Add/Search，不在 Search 中生成最终答案。
-- MemGallery 离线研究流程另带 Reader 及诊断 EM/F1，不能混同为赛事统一 Answer/Eval。
+- 原始历史切片 → 向量召回 → 重排 → 返回来源文字与原始图片，Search 不生成最终答案。
+- 图片通过视觉描述参与文本向量检索，当前不使用直接图片向量检索。
+- 默认模型：`gpt-4o-mini`、`text-embedding-v4`、`rerank-v3.5`。
+- 窗口 256 tokens，重叠 32 tokens，召回最多 128 个候选，重排返回最多 15 条。
+- 比赛接口按 session 切片、按 user_id 隔离，支持同用户跨会话检索。
+- 新增 SQLite 持久化、幂等写入、访问认证及媒体校验。
 
-## 新增实现
+## 部署
 
-1. MemGallery 原始历史、查询图片和参考标注分离加载；来源图片保持可追溯。
-2. 视觉描述检索及多模态证据返回。
-3. SQLite 持久化 Add/Search 服务、用户隔离、幂等写入、认证及媒体限制。
-4. 可选重排专用代理，不要求将其他上游 API 全局代理。
-5. 小样例测试、可续跑的全量图片预处理、部署配置与接口说明。
-6. 本地 Qwen3-Reranker-4B 重排、下载后实际推理检查，以及等待预处理完成的全量评测入口。
-
-## 安装和启动
-
-API 服务需要 Linux、Python 3.10+，可用 CPU 运行接口逻辑；模型推理由外部 API 提供。
-2 核 4GB 的 CPU 实例不是本地大模型推理服务器。
+需要 Linux、Python 3.10+。默认通过外部 API 调用模型，无需在接口服务器加载大模型。
 
 ```bash
 cd methods/EverCore
@@ -37,9 +26,9 @@ cp .env.aml.example .env.aml
 chmod 600 .env.aml
 ```
 
-在私有 `.env.aml` 中填写三个上游模型的 URL、Key，以及自行生成的随机服务访问令牌
-`AML_API_TOKEN`（至少 32 字符）。该令牌不是模型厂商 Key。
-配置不要提交 Git，也不要写入命令行参数或报告。
+在 `.env.aml` 填写模型地址、模型 Key，以及至少 32 字符的随机 `AML_API_TOKEN`。
+`AML_API_TOKEN` 是本服务的访问密码，不是模型厂商的 Key。不要公开私有配置。
+如重排需要代理，可设置 `RERANK_PROXY_URL`；请确保网络出口和模型额度持续可用。
 
 ```bash
 .venv/bin/python -m evaluation.src.aml serve \
@@ -47,136 +36,59 @@ chmod 600 .env.aml
   --host 127.0.0.1 --port 8080
 ```
 
-生产部署模板见 `methods/EverCore/deployment/rawrag-aml.service`。
-公网 IP 入口模板为 `nginx-ip-http.conf` / `nginx-ip-https.conf`，其中
-`__PUBLIC_IP__` 需替换成自己的地址。HTTPS 模板需要先取得可验证的 IP 证书，
-配置自动续期并放行必要安全组端口，不能直接使用缺少证书的模板启动。
-公网开放还应遵守接入商及所在地适用要求，购买服务器不等于自动完成备案。
+常驻服务与公网 IP 入口模板见 [deployment](methods/EverCore/deployment/)。
+公网使用 HTTPS，配置有效证书、自动续期及必要安全组规则；不要将内部代理开放到公网。
 
-## API
+## 接口
 
-- 无认证健康检查：`GET /health`。
-- 写入：`POST /v1/memories/add`。
-- 检索：`POST /v1/memories/search`。
-- 认证支持 `Authorization: Token <AML_API_TOKEN>`、Bearer 或 `X-Api-Key`。
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| GET | `/health` | 无需认证的健康检查 |
+| POST | `/v1/memories/add` | 写入并持久化记忆 |
+| POST | `/v1/memories/search` | 返回相关证据 |
 
-Add 示例：
+认证支持 `Authorization: Token <AML_API_TOKEN>`、Bearer 或 `X-Api-Key`。
+
+**Add 请求：**
 
 ```json
 {
-  "request_id": "example-write-1",
-  "user_id": "example-user",
-  "session_id": "example-session",
+  "request_id": "write-1",
+  "user_id": "user-1",
+  "session_id": "session-1",
   "messages": [{"role": "user", "content": "I bought a red card in Paris."}]
 }
 ```
 
-写入落盘且可检索后，返回包含原始三个标识及 `success: true` 的 HTTP 200。
-相同用户下相同 request_id 和相同载荷幂等；不同载荷明确冲突。
+写入完成且立即可检索后返回 HTTP 200，响应为
+`{"success": true, "request_id": "write-1", "user_id": "user-1", "session_id": "session-1"}`。
+同一用户的相同 request_id 与载荷幂等；同一请求号但载荷不同则返回冲突。
 
-Search 示例：
+**Search 请求：**
 
 ```json
-{"user_id": "example-user", "query": "Where did I buy the card?", "top_k": 100}
+{"user_id": "user-1", "query": "Where did I buy the card?", "top_k": 100}
 ```
 
-返回 `{"data": [{"id": "stable-id", "content": "source evidence", "score": 0.9}]}`。
-实际返回不超过 `min(top_k, 15)`；无结果为 `{"data": []}`。
-多模态 content/query 使用有序 `text` / `image_url` 数组，图片必须为内联 Base64
-Data URI，不能传外部图片链接。完整核对表见 `evaluation/docs/AML_CONTRACT_ZH.md`。
+响应为 `{"data": [{"id": "stable-id", "content": "source evidence", "score": 0.9}]}`。
+按相关性排序，不超过 `min(top_k, 15)` 条；无结果为 `{"data": []}`。
+多模态 content/query 使用有序 `text` / `image_url` 数组，图片必须为内联 Base64 Data URI。
+完整格式见 [接口说明](methods/EverCore/evaluation/docs/AML_CONTRACT_ZH.md)
+和 [比赛官方契约](https://agentmemoryleaderboard.ai/api-guide)。
 
-## 运行限制与数据治理
+## 限制与数据管理
 
-- JPEG/PNG/WebP；单张图片解码不超过 10 MiB。
-- 单次 Add 媒体总量及单次 Search 响应媒体总量各不超过 30 MiB。
-- 请求体最大 128 MiB；默认同时处理 2 个请求，超出容量返回 429。
-- 一个数据目录只允许一个服务进程；不是分布式高可用服务。
-- 缓存和记忆均按 user_id 隔离，session_id 不限制同用户跨会话检索。
-- 不记录原始 API 请求正文。运营方应按赛事规则安排清理，不允许训练或另作分发。
-- 停止服务后可用 `python -m evaluation.src.aml purge-user --env-file .env.aml --data-dir <目录> --user-id <用户>` 删除该用户数据。
-- 不保证未压测的大规模容量；临时电脑代理和手工 SSH 通道不等于无人值守生产出口。
-
-## MemGallery 复现
-
-先安装离线评测依赖 `requirements-multimodal.txt`，数据按原数据集条款单独获取。
-默认不使用数据集现成图片说明，也不把答案或 clue 输入检索。
-
-```bash
-python -m evaluation.src.multimodal.full_run --stage captions \
-  --data-root /absolute/path/to/Mem-Gallery --env-file .env.aml \
-  --output /absolute/path/to/run --caption-workers 2
-```
-
-该步骤处理完整 20 场景的 1,003 张历史图片和 487 张查询图片，缓存可续跑。
-Cohere Trial 每月 1,000 次调用不足以重排全部 1,711 道题；确认有足够合法额度后：
-
-```bash
-python -m evaluation.src.multimodal.full_run --stage evaluate \
-  --data-root /absolute/path/to/Mem-Gallery --env-file .env.aml \
-  --output /absolute/path/to/run --confirm-full-rerank-quota
-```
-
-不要在没有额度时使用确认标志，也不要通过轮换账号绕过限制。
-
-### 本地 Qwen4B 重排
-
-此配置用于有 CUDA GPU 的研究服务器，不适用于 2 核 4GB 的 CPU 云服务器。
-当前实现使用 BF16、SDPA、每批 4 个候选，在本地对候选文本进行 yes/no 相关性打分，
-不调用 Cohere，也不会在失败时退回 Cohere。图片仍经视觉描述参与文本召回和重排，
-这不是原生多模态重排。视觉描述、向量生成和 Reader 仍调用各自外部 API，可能产生费用。
-
-```bash
-pip install -r requirements-local-reranker.txt
-export QWEN_RERANK_MODEL_PATH=/absolute/path/to/models/Qwen3-Reranker-4B
-CUDA_VISIBLE_DEVICES=0 python -m evaluation.src.multimodal.download_reranker \
-  --output "$QWEN_RERANK_MODEL_PATH"
-```
-
-下载器从官方 ModelScope 模型仓库获取安全权重及分词器文件，不执行远程模型代码。
-只有实际加载并通过中英文排序检查及 128 候选检查后，才生成 `load_test_passed.json`。
-将相同 `QWEN_RERANK_MODEL_PATH` 写入私有 `.env.aml`，在图片预处理完成后运行：
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python -m evaluation.src.multimodal.full_run --stage evaluate \
-  --data-root /absolute/path/to/Mem-Gallery --env-file .env.aml \
-  --config evaluation/config/systems/memgallery_local_qwen4b.yaml \
-  --output /absolute/path/to/run --wait-for-prerequisites
-```
-
-等待模式最多等待 12 小时，检查全部图片描述缓存及模型验证标记；同一输出目录中的
-`captions.pid`、`reranker-download.pid` 可用于检查前置后台任务是否提前停止。
-每题结果写入 `evaluation/results.jsonl`，汇总为 `evaluation/summary.json`，相同配置可续跑。
-超长重排输入明确报错，不静默截断。此配置与 Cohere 配置是不同实验，比较时需注明。
-
-Reader 每题最多 10 张图片，优先保留全部查询图；其余历史图预算及截断计数写入结果。
-离线读取图片的体积限制与比赛 API 不同：研究流程最多 20 MiB，API 最多 10 MiB。
-EM/F1 和来源轮次召回仅为诊断指标，不是官方 LLM 评审结果。
-
-## 已有验证
-
-完整写入一个 MemGallery 场景的 406 条消息、30 张历史图片后，测试 3 道题
-（含图片查询），来源证据召回分别为 100%、100%、50%。这不代表全部答对或全集成绩。
-同一快照在云端检索复测一致；全新图片 Add/Search、未认证拒绝、用户隔离、
-服务重启后持久化检查通过。全量结果尚未完成，不将运行中任务写成完成成绩。
-公网可信 HTTPS 的图片 Add、文字 Search、图片 Search、未认证拒绝和用户隔离检查通过；
-IP 证书的模拟续期通过。这些是自测，不是赛事平台签发的正式 smoke 或评分结果。
-独立导出的公开源码通过 124 项测试。在单张 RTX 3090 上，Qwen4B 的中英文排序检查通过；
-128 个合成候选重排耗时 3.62 秒，峰值已分配显存约 7.6 GiB。这不是全集速度或效果保证。
+- 图片支持 JPEG、PNG、WebP；单图解码后不超过 10 MiB。
+- 单次 Add 和单次 Search 响应的媒体总量各不超过 30 MiB；请求体最大 128 MiB。
+- 默认并发 2，容量不足返回 429；每个数据目录仅允许一个服务进程。
+- 不记录原始 API 请求正文；运营方需按赛事要求安排数据清理。
+- 停止服务后，可使用 `python -m evaluation.src.aml purge-user --env-file .env.aml --data-dir <目录> --user-id <用户>` 删除指定用户数据。
 
 ## 测试
+
+在 `methods/EverCore` 目录执行，无需真实模型 Key：
 
 ```bash
 pip install pytest pytest-asyncio
 python -m pytest tests/test_aml_api.py tests/test_aml_smoke.py -q
 ```
-
-安装离线评测依赖后，可进一步运行 `tests/test_memgallery_*.py` 和
-`tests/test_multimodal_media.py`。测试使用合成凭据，不需要真实模型 Key。
-
-## 参考
-
-- 上游代码与论文：https://github.com/Litmeb/RAW-RAG
-- AML 接口契约：https://agentmemoryleaderboard.ai/api-guide
-- Cohere 调用限制：https://docs.cohere.com/docs/rate-limits
-- MemGallery：https://huggingface.co/datasets/Ethan-Bei/Mem-Gallery
-- Qwen3-Reranker-4B：https://huggingface.co/Qwen/Qwen3-Reranker-4B
