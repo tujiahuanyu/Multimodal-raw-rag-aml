@@ -1,0 +1,26 @@
+[Unit]
+Description=Raw-RAG AML memory API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rawrag
+Group=rawrag
+WorkingDirectory=/opt/rawrag-aml/app
+Environment=PYTHONUNBUFFERED=1
+Environment=TIKTOKEN_CACHE_DIR=/var/cache/rawrag-aml
+ExecStart=/opt/rawrag-aml/venv/bin/python -m evaluation.src.aml serve --env-file /etc/rawrag-aml.env --data-dir /var/lib/rawrag-aml --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rawrag-aml /var/cache/rawrag-aml
+MemoryMax=2G
+
+[Install]
+WantedBy=multi-user.target

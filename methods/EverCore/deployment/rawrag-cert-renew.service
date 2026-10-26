@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew Raw-RAG public IP TLS certificate
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/rawrag-aml/certbot-venv/bin/certbot renew --quiet --deploy-hook "/usr/bin/systemctl reload nginx"
