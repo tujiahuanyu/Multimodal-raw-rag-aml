@@ -1,9 +1,9 @@
 # Multimodal Raw-RAG AML
 
-面向 Agent Memory Leaderboard 的多模态记忆写入与检索服务。
-基于 [Litmeb/RAW-RAG](https://github.com/Litmeb/RAW-RAG)，上游提交为
+面向 Agent Memory Leaderboard Add/Search 契约的多模态 Raw-RAG 适配。
+本仓库派生自 [Litmeb/RAW-RAG](https://github.com/Litmeb/RAW-RAG)，上游基线提交为
 `95639191e9547219b426710e50fe1a36235e26fc`，保留原项目 LICENSE。
-本仓库为适配版本，非原作者官方比赛服务。
+原方法与论文作者归上游项目所有；本仓库并非原作者官方发布的比赛服务。
 
 ## 方法
 
@@ -27,7 +27,7 @@ chmod 600 .env.aml
 ```
 
 在 `.env.aml` 填写模型地址、模型 Key，以及至少 32 字符的随机 `AML_API_TOKEN`。
-`AML_API_TOKEN` 是本服务的访问密码，不是模型厂商的 Key。不要公开私有配置。
+`AML_API_TOKEN` 是本服务的访问密码。
 如重排需要代理，可设置 `RERANK_PROXY_URL`；请确保网络出口和模型额度持续可用。
 
 ```bash
@@ -37,7 +37,7 @@ chmod 600 .env.aml
 ```
 
 常驻服务与公网 IP 入口模板见 [deployment](methods/EverCore/deployment/)。
-公网使用 HTTPS，配置有效证书、自动续期及必要安全组规则；不要将内部代理开放到公网。
+公网使用 HTTPS，配置有效证书、自动续期及必要安全组规则。
 
 ## 接口
 
@@ -81,7 +81,7 @@ chmod 600 .env.aml
 - 图片支持 JPEG、PNG、WebP；单图解码后不超过 10 MiB。
 - 单次 Add 和单次 Search 响应的媒体总量各不超过 30 MiB；请求体最大 128 MiB。
 - 默认并发 2，容量不足返回 429；每个数据目录仅允许一个服务进程。
-- 不记录原始 API 请求正文；运营方需按赛事要求安排数据清理。
+- 不记录原始 API 请求正文；按赛事要求安排数据清理。
 - 停止服务后，可使用 `python -m evaluation.src.aml purge-user --env-file .env.aml --data-dir <目录> --user-id <用户>` 删除指定用户数据。
 
 ## 测试
