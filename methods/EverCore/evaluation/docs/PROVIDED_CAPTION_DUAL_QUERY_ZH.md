@@ -72,5 +72,38 @@ run 默认仍使用私有配置中的重排服务，执行前确认额度；本�
 - 6 题中有 5 题完整命中标注线索，另 1 题未命中；这不是答案正确率，也不是 LLM-Judge 分数，不能据此声称新方法已提分。
 - 没有修改阿里云部署或正在运行的旧 Mem-Gallery 全量实验，也没有发起平台 Smoke／Full。
 
+## 2026-10-27 杭州部署核验
+
+用户确认没有运行中的 Full 后，将 GitHub 已发布提交
+`b649f52de198cc63c5159c223eda5d0e1554588f` 部署到杭州实例。
+
+| 检查 | 结果 |
+| --- | --- |
+| 云端 Python 3.10 隔离接口回归 | 100 项通过，5.33 秒；一条现有 Starlette 测试客户端弃用提醒 |
+| 部署后公网 HTTPS 官方文档样例自测 | 32 项通过，69.27 秒；从外部 Windows 客户端调用并验证 TLS 证书 |
+| 健康检查 | raw-rag-aml-v1.2，服务持续 active，重启计数为 0 |
+| 运行文件一致性 | 全部 10 个 AML Python 文件与固定发布提交的 SHA-256 一致 |
+| 持久化隔离 | 全新 v1.2 数据目录，不复制或迁移旧评测记忆；旧数据库大小和修改时间未变 |
+
+新的运行目录为 `/opt/rawrag-aml/releases/b649f52de198cc63c5159c223eda5d0e1554588f/methods/EverCore`，
+数据目录为 `/var/lib/rawrag-aml-v12-b649f52`。
+v1.1 原代码 `/opt/rawrag-aml/app` 和数据目录 `/var/lib/rawrag-aml` 保留。
+原服务配置及发布信息另备份在 `/opt/rawrag-aml/backups/pre-v12-20261027T072723Z`。
+
+Add/Search 公网地址、认证方式和记忆系统 Key 保持不变。新测试是参赛方的文档样例
+兼容检查，不是主办方正式 Smoke、完整评测或分数证明；没有自动发起平台评测。
+平台提交应绑定 v1.2 和上述源码提交，先重新运行该版本的 Smoke。
+云端仍使用原 Cohere 重排及其现有代理配置，Trial 额度、电脑代理依赖和长期容量
+边界没有因本次部署而解决。旧数据仍须遵守评测结束后 30 天内清理的要求。
+
+如需回滚，可由服务器管理员执行以下命令。它恢复旧代码入口和旧数据目录，
+不会删除 v1.2 或 v1.1 的数据库：
+
+```bash
+sudo /opt/rawrag-aml/venv/bin/python \
+  /opt/rawrag-aml/staging/v12-b649f52/deploy_v12.py rollback \
+  --backup /opt/rawrag-aml/backups/pre-v12-20261027T072723Z
+```
+
 官方输入格式依据：[赛事说明](https://agentmemoryleaderboard.ai/competition/#tracks)、
 [Add/Search 指南](https://agentmemoryleaderboard.ai/api-guide)。

@@ -31,7 +31,7 @@ caption 缺失时保留原始图片但不生成替代说明，也不虚构跨图
 
 ## 模型与实验边界
 
-线上默认描述模型为 `gpt-4o-mini`，向量模型为 `text-embedding-v4`，重排为
+线上默认查询图片描述模型为 `gpt-4o-mini`，向量模型为 `text-embedding-v4`，重排为
 `rerank-v3.5`。模型调用通过私有配置指定的服务提供方完成，仓库不包含真实凭据。
 
 另有本地 GPU 的 `Qwen3-Reranker-4B` MemGallery 研究配置，与云端 Cohere 配置分开。
