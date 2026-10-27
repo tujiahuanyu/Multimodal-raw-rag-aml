@@ -10,7 +10,7 @@ import pytest
 
 from evaluation.src.aml.app import create_app
 from evaluation.src.aml.config import Settings, endpoint
-from evaluation.src.aml.providers import Providers, ServiceError
+from evaluation.src.aml.providers import Providers, ServiceError, query_plan
 from evaluation.src.aml.store import Store
 
 
@@ -19,6 +19,9 @@ class FakeProviders:
         self.embedding_inputs = []
         self.caption_inputs = []
         self.detail_inputs = []
+        self.planner_inputs = []
+        self.plan = {'mode': 'single', 'subqueries': []}
+        self.fail_planner = False
         self.rerank_inputs = []
         self.rerank_limits = []
         self.fail_embedding = False
@@ -27,6 +30,12 @@ class FakeProviders:
 
     async def close(self):
         pass
+
+    async def plan_query(self, text, images, options):
+        self.planner_inputs.append((text, images, options))
+        if self.fail_planner:
+            raise ServiceError(502, 'planner_http_403')
+        return self.plan
 
     async def caption(self, url, context):
         self.caption_inputs.append((url, context))
@@ -566,12 +575,12 @@ async def test_only_rerank_uses_configured_proxy(settings, monkeypatch):
 
     monkeypatch.setattr(httpx, 'AsyncClient', RecordingClient)
     provider = Providers(replace(settings, rerank_proxy_url='http://127.0.0.1:47897'))
-    for name in ['vision', 'embedding', 'rerank']:
+    for name in ['vision', 'embedding', 'rerank', 'planner']:
         await provider._post(name, 'https://upstream.example', 'test-key', {})
     assert len(clients) == 2
     assert 'proxy' not in clients[0].configuration
     assert clients[1].configuration['proxy'] == 'http://127.0.0.1:47897'
-    assert len(clients[0].requests) == 2
+    assert len(clients[0].requests) == 3
     assert len(clients[1].requests) == 1
     await provider.close()
     assert all(client.closed for client in clients)
@@ -1414,6 +1423,314 @@ async def test_image_details_provider_validates_grounded_multi_view_json(
         assert recorded[0]['messages'][1]['content'][1]['image_url']['detail'] == 'high'
     finally:
         await provider.close()
+
+
+def test_planner_runs_once_before_query_caption_and_never_on_add(client, backend):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    assert not backend.planner_inputs
+    original = backend.caption
+
+    async def caption(url, context):
+        assert len(backend.planner_inputs) == 1
+        return await original(url, context)
+
+    backend.caption = caption
+    query = [{'type': 'text', 'text': 'Where was this bought?'}, image_part()]
+    payload = {**search_payload(query=query), 'options': ['A. Paris', 'B. Rome']}
+    reply = client.post('/v1/memories/search', json=payload)
+    assert reply.status_code == 200
+    assert backend.planner_inputs == [
+        ('Where was this bought?', [image_url()], ['A. Paris', 'B. Rome'])
+    ]
+    assert len(backend.caption_inputs) == 1
+    assert len(backend.rerank_inputs) == 1
+
+
+@pytest.mark.parametrize('user,top_k', [('empty-user', 100), ('user-1', 0)])
+def test_no_planner_for_empty_scope_or_zero_results(client, backend, user, top_k):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    response = client.post(
+        '/v1/memories/search', json={**search_payload(user=user), 'top_k': top_k}
+    )
+    assert response.json() == {'data': []}
+    assert not backend.planner_inputs
+    assert not backend.rerank_inputs
+
+
+def test_subquestions_retrieve_independently_fuse_and_rerank_once(
+    client, backend, monkeypatch
+):
+    for position, content in enumerate(
+        ['Red source.', 'Blue source.', 'Original question source.']
+    ):
+        payload = add_payload(
+            request=f'write-{position}', session=f'session-{position}', content=content
+        )
+        assert client.post('/v1/memories/add', json=payload).status_code == 200
+    store = client.app.state.engine.store
+    sources = [
+        store.messages('user-1', f'session-{position}')[0] for position in range(3)
+    ]
+    rows = [
+        {
+            'chunk_id': f'chunk-{position}',
+            'content': source['render'],
+            'score': 0.8,
+            'source_ids': [source['message_id']],
+        }
+        for position, source in enumerate(sources)
+    ]
+    vectors = []
+
+    def retrieve(user, vector, count):
+        assert user == 'user-1' and count == 128
+        vectors.append(vector)
+        if vector[1] > 0:
+            return [rows[0]]
+        if vector[2] > 0:
+            return [rows[1]]
+        return [rows[2]]
+
+    monkeypatch.setattr(store, 'candidates', retrieve)
+    backend.plan = {
+        'mode': 'decompose',
+        'subqueries': ['Find red-trip evidence.', 'Find blue-trip evidence.'],
+    }
+    before = len(backend.embedding_inputs)
+    question = 'Compare these two trips.'
+    result = client.post('/v1/memories/search', json=search_payload(query=question))
+    assert result.status_code == 200
+    assert len(backend.planner_inputs) == 1 and len(vectors) == 3
+    assert backend.embedding_inputs[before:] == [question, *backend.plan['subqueries']]
+    assert len(backend.rerank_inputs) == 1 and backend.rerank_limits == [3]
+    rerank_query, candidates = backend.rerank_inputs[0]
+    assert question in rerank_query
+    assert all(text in rerank_query for text in backend.plan['subqueries'])
+    assert {row['chunk_id'] for row in candidates} == {'chunk-0', 'chunk-1', 'chunk-2'}
+    assert {row['id'] for row in result.json()['data']} == {
+        source['message_id'] for source in sources
+    }
+    assert 'Retrieval subquestions' not in json.dumps(result.json())
+
+
+def test_decomposed_visual_query_keeps_original_and_caption_lanes(
+    client, backend, monkeypatch
+):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    backend.plan = {
+        'mode': 'decompose',
+        'subqueries': ['Locate the red item.', 'Locate its Paris purchase.'],
+    }
+    engine = client.app.state.engine
+    retrieve = engine.store.candidates
+    branches = []
+
+    def candidates(user, vector, count):
+        branches.append(vector)
+        return retrieve(user, vector, count)
+
+    monkeypatch.setattr(engine.store, 'candidates', candidates)
+    before = len(backend.embedding_inputs)
+    question = 'Compare the two associated events.'
+    payload = search_payload(query=[{'type': 'text', 'text': question}, image_part()])
+    result = client.post('/v1/memories/search', json=payload)
+    assert result.status_code == 200
+    assert len(branches) == 4
+    assert backend.embedding_inputs[before:] == [
+        question,
+        'A red backpack.',
+        *backend.plan['subqueries'],
+    ]
+    assert len(backend.rerank_inputs) == 1
+    assert backend.planner_inputs[0][1] == [image_url()]
+
+
+def test_subquery_duplicates_do_not_create_duplicate_retrieval_lanes(
+    client, backend, monkeypatch
+):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    question = 'red backpack'
+    backend.plan = {
+        'mode': 'decompose',
+        'subqueries': [question, 'Blue bicycle', ' BLUE  BICYCLE '],
+    }
+    engine = client.app.state.engine
+    original = engine.store.candidates
+    calls = []
+
+    def candidates(user, vector, count):
+        calls.append(vector)
+        return original(user, vector, count)
+
+    monkeypatch.setattr(engine.store, 'candidates', candidates)
+    result = client.post('/v1/memories/search', json=search_payload(query=question))
+    assert result.status_code == 200
+    assert len(calls) == 2
+    assert len(backend.rerank_inputs) == 1
+
+
+@pytest.mark.parametrize(
+    'mode,top_k,expected',
+    [
+        ('single', 100, 15),
+        ('decompose', 100, 30),
+        ('decompose', 16, 16),
+        ('decompose', 1, 1),
+    ],
+)
+def test_adaptive_output_limits_apply_after_unique_source_expansion(
+    client, backend, mode, top_k, expected
+):
+    payload = add_payload()
+    payload['messages'] = [
+        {
+            'role': 'user',
+            'content': f'Original observation number {position} from the trip.',
+        }
+        for position in range(40)
+    ]
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    backend.plan = {
+        'mode': mode,
+        'subqueries': (
+            ['First trip observations?', 'Second trip observations?']
+            if mode == 'decompose'
+            else []
+        ),
+    }
+    result = client.post(
+        '/v1/memories/search', json={**search_payload(), 'top_k': top_k}
+    )
+    assert result.status_code == 200
+    rows = result.json()['data']
+    assert len(rows) == expected
+    assert len({row['id'] for row in rows}) == expected
+    assert len(backend.planner_inputs) == 1 and len(backend.rerank_inputs) == 1
+
+
+def test_planner_failure_stops_before_caption_embedding_and_rerank(client, backend):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    backend.fail_planner = True
+    before = len(backend.embedding_inputs)
+    result = client.post(
+        '/v1/memories/search', json=search_payload(query=[image_part()])
+    )
+    assert result.status_code == 502
+    assert result.json() == {'error': 'planner_http_403'}
+    assert len(backend.planner_inputs) == 1
+    assert len(backend.embedding_inputs) == before
+    assert not backend.caption_inputs and not backend.rerank_inputs
+
+
+@pytest.mark.parametrize(
+    'plan',
+    [
+        None,
+        {},
+        {'mode': 'single', 'subqueries': ['invented answer']},
+        {'mode': 'decompose', 'subqueries': ['one']},
+        {'mode': 'decompose', 'subqueries': ['x', ' X ']},
+        {'mode': 'decompose', 'subqueries': ['one', 'two'], 'answer': 'guessed'},
+    ],
+)
+def test_malformed_planner_does_not_silently_use_old_path(client, backend, plan):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    backend.plan = plan
+    before = len(backend.embedding_inputs)
+    result = client.post('/v1/memories/search', json=search_payload())
+    assert result.status_code == 502
+    assert result.json() == {'error': 'planner_invalid_response'}
+    assert len(backend.embedding_inputs) == before
+    assert not backend.rerank_inputs
+
+
+@pytest.mark.parametrize(
+    'plan',
+    [
+        {'mode': 'single', 'subqueries': []},
+        {'mode': 'decompose', 'subqueries': ['First fact?', 'Second fact?']},
+        {
+            'mode': 'decompose',
+            'subqueries': ['First fact?', ' First FACT? ', 'Second fact?'],
+        },
+    ],
+)
+def test_valid_query_plans_are_normalized(plan):
+    result = query_plan(plan)
+    assert result['mode'] == plan['mode']
+    assert len(result['subqueries']) == (0 if plan['mode'] == 'single' else 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'value,finish,valid',
+    [
+        ({'mode': 'single', 'subqueries': []}, 'stop', True),
+        (
+            {'mode': 'decompose', 'subqueries': ['First fact?', 'Second fact?']},
+            'stop',
+            True,
+        ),
+        ({'mode': 'single', 'subqueries': []}, 'length', False),
+        ({'mode': 'single', 'subqueries': []}, 'content_filter', False),
+        ({'mode': 'decompose', 'subqueries': ['x' * 601, 'second']}, 'stop', False),
+        ({'mode': 'decompose', 'subqueries': ['a', 'b', 'c', 'd', 'e']}, 'stop', False),
+        ({'mode': 'decompose', 'subqueries': [None, 'second']}, 'stop', False),
+        ({'mode': 'unknown', 'subqueries': []}, 'stop', False),
+        ('invalid JSON', 'stop', False),
+    ],
+)
+async def test_planner_provider_validates_json_and_preserves_raw_query_inputs(
+    settings, value, finish, valid
+):
+    provider = Providers(settings)
+    recorded = []
+
+    async def response(name, url, key, payload):
+        assert name == 'planner' and url == settings.vision_url
+        recorded.append(payload)
+        return {
+            'choices': [
+                {
+                    'finish_reason': finish,
+                    'message': {
+                        'content': (
+                            json.dumps(value) if isinstance(value, dict) else value
+                        )
+                    },
+                }
+            ]
+        }
+
+    provider._post = response
+    try:
+        if valid:
+            await provider.plan_query(
+                'Original question', [image_url()], ['A. first', 'B. second']
+            )
+        else:
+            with pytest.raises(ServiceError, match='planner_invalid_response'):
+                await provider.plan_query(
+                    'Original question', [image_url()], ['A. first', 'B. second']
+                )
+        assert len(recorded) == 1
+        request = recorded[0]
+        assert request['model'] == 'gpt-4o-mini'
+        assert request['response_format'] == {'type': 'json_object'}
+        parts = request['messages'][1]['content']
+        assert json.loads(parts[0]['text']) == {
+            'question': 'Original question',
+            'options': ['A. first', 'B. second'],
+        }
+        assert parts[1]['image_url']['url'] == image_url()
+    finally:
+        await provider.close()
+
+
+@pytest.mark.parametrize('count', [14, 129])
+def test_invalid_multi_result_cap_is_rejected(settings, count):
+    with pytest.raises(ValueError, match='retrieval counts'):
+        replace(settings, multi_result_count=count)
 
 
 def test_new_caption_protocol_rejects_a_legacy_data_directory(settings):
