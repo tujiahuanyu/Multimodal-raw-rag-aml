@@ -8,18 +8,17 @@
 
 ## 方法
 
-- Query 先由 `gpt-4o-mini` 判断直接检索或拆成 2–4 个子问题；各路召回合并后只重排一次，展开完整原始消息并按消息 ID 去重，返回原始文字与图片；Search 不生成最终答案。
+- 原始历史切片和图片描述索引 → 向量召回 → 一次候选重排（保留全部候选排序）→ 展开完整原始消息 → 按消息 ID 去重 → 取前 15 条来源消息，返回原始文字与图片；Search 不生成最终答案。
 - Add 保留传入的原文与 caption；每张历史图片额外通过一次 `gpt-4o-mini` 调用生成最多 4 条互补细节描述。原始相邻文本及各条生成描述独立可检索，并绑定对应图片和原始消息；不把生成描述改写进原始证据。
-- 直接检索保持原问题／查询图说明双路流程；复杂问题额外按各子问题分别向量召回，以 RRF 合并去重。规划器读取原问题、原图及 options，但不生成答案；当前不使用直接图片向量检索。
+- 含图 Search 先描述查询图片，再用原始问题和图片描述独立向量召回，以 RRF 合并去重，之后只重排一次；当前不使用直接图片向量检索。
 - 默认模型：`gpt-4o-mini`、`text-embedding-v4`、`rerank-v3.5`。
-- 窗口 256 tokens，重叠 32 tokens；每路召回最多 128 个候选，最多 6 路，融合后最多重排 128 个候选。直接模式最多 min(top_k, 15) 条消息，拆分模式最多 min(top_k, 30) 条；重复或超媒体预算时继续向后补足。
+- 窗口 256 tokens，重叠 32 tokens；每路召回最多 128 个候选，融合后最多重排 128 个候选，展开去重后再取最多 min(top_k, 15) 条消息；重复或超媒体预算时继续向后补足。
 - 比赛接口按 session 切片、按 user_id 隔离，支持同用户跨会话检索。
 - 新增 SQLite 持久化、幂等写入、访问认证及媒体校验。
-- 当前代码为 `v1.4`，不沿用历史版本成绩；实际部署版本以 `/health` 为准。自适应拆分见 [v1.4 说明](methods/EverCore/evaluation/docs/ADAPTIVE_QUERY_RETRIEVAL_ZH.md)，图片多描述及噪声控制见 [v1.3 说明](methods/EverCore/evaluation/docs/MULTI_VIEW_IMAGE_RETRIEVAL_ZH.md)。ATM 来源兼容范围及消息去重规则见 [核查说明](methods/EverCore/evaluation/docs/ATM_AND_MESSAGE_DEDUP_ZH.md)。
+- 当前代码为 `v1.3`，不沿用历史版本成绩；实际部署版本以 `/health` 为准。图片多描述及噪声控制见 [v1.3 说明](methods/EverCore/evaluation/docs/MULTI_VIEW_IMAGE_RETRIEVAL_ZH.md)。双路查询基础见 [v1.2 说明](methods/EverCore/evaluation/docs/PROVIDED_CAPTION_DUAL_QUERY_ZH.md)。ATM 来源兼容范围及消息去重规则见 [核查说明](methods/EverCore/evaluation/docs/ATM_AND_MESSAGE_DEDUP_ZH.md)。
 
-2026-10-27 已发布 v1.4：本地 221 项回归、云端 150 项回归、外网官方样例 32 项和
-新增自造双会话检查 9 项通过。使用全新索引，旧版保留；样例自测不等于平台正式 Smoke，
-公开 6 题仍为 5/6 找全证据，未证明能力分提升。
+2026-10-27 已发布 v1.3：本地 190 项回归、云端 119 项回归及外网官方样例 32 项检查通过。
+使用全新索引，旧版保留；样例自测不等于平台正式 Smoke，公开 6 题对照也未显示召回提升。
 
 ## 部署
 
@@ -37,8 +36,8 @@ chmod 600 .env.aml
 `AML_API_TOKEN` 是本服务的访问密码。
 如重排需要代理，可设置 `RERANK_PROXY_URL`；请确保网络出口和模型额度持续可用。
 
-v1.4 改变检索协议和返回数量配置，必须使用全新 `--data-dir`，不能直接复用
-v1.3 或更早版本的数据库或已有 Full 运行状态。服务会拒绝旧配置的数据目录，不自动删除数据。
+v1.3 增加独立图片描述索引，必须使用全新 `--data-dir`，不能直接复用
+v1.2 或更早版本的数据库或已有 Full 运行状态。服务会拒绝旧配置的数据目录，不自动删除数据。
 
 ```bash
 .venv/bin/python -m evaluation.src.aml serve \
@@ -81,7 +80,7 @@ v1.3 或更早版本的数据库或已有 Full 运行状态。服务会拒绝旧
 ```
 
 响应为 `{"data": [{"id": "stable-id", "content": "source evidence", "score": 0.9}]}`。
-按相关性排序，直接模式不超过 `min(top_k, 15)` 条，拆分模式不超过 `min(top_k, 30)` 条；无结果为 `{"data": []}`。
+按相关性排序，不超过 `min(top_k, 15)` 条；无结果为 `{"data": []}`。
 多模态 content/query 使用有序 `text` / `image_url` 数组，图片必须为内联 Base64 Data URI。
 完整格式见 [接口说明](methods/EverCore/evaluation/docs/AML_CONTRACT_ZH.md)
 和 [比赛官方契约](https://agentmemoryleaderboard.ai/api-guide)。

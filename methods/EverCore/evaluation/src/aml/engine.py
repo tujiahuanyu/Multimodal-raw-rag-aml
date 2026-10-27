@@ -11,7 +11,7 @@ import warnings
 from PIL import Image
 import tiktoken
 
-from .providers import ServiceError, image_descriptions, query_plan
+from .providers import ServiceError, image_descriptions
 from .store import digest
 
 
@@ -292,13 +292,6 @@ class Engine:
                     part['text'] for part in content if part['type'] == 'text'
                 )
             )
-            plan = query_plan(
-                await self.providers.plan_query(
-                    text,
-                    list(dict.fromkeys(image[3] for image in images)),
-                    request.options or [],
-                )
-            )
             descriptions = []
             for key, mime, data, url in images:
                 caption = await self._caption(request.user_id, key, url, '', 'query')
@@ -307,11 +300,7 @@ class Engine:
                 text += '\nAnswer options:\n' + '\n'.join(request.options)
             description = '\n'.join(dict.fromkeys(descriptions))
             queries = list(
-                dict.fromkeys(
-                    value
-                    for value in [text, description, *plan['subqueries']]
-                    if value.strip()
-                )
+                dict.fromkeys(value for value in [text, description] if value.strip())
             )
             vectors = await self._vectors(request.user_id, queries)
             rankings = []
@@ -330,21 +319,10 @@ class Engine:
             rerank_query = text
             if description:
                 rerank_query += '\nQuery image descriptions:\n' + description
-            if plan['subqueries']:
-                rerank_query += '\nRetrieval subquestions (not answers):\n' + '\n'.join(
-                    plan['subqueries']
-                )
             ranked_chunks = await self.providers.rerank(
                 rerank_query, candidates, len(candidates)
             )
-            limit = min(
-                request.top_k,
-                (
-                    self.settings.multi_result_count
-                    if plan['mode'] == 'decompose'
-                    else self.settings.result_count
-                ),
-            )
+            limit = min(request.top_k, self.settings.result_count)
             output = []
             total_media = 0
             for candidate in self._message_candidates(ranked_chunks):
