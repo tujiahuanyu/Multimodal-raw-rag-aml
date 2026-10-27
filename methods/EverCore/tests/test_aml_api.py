@@ -18,10 +18,12 @@ class FakeProviders:
     def __init__(self):
         self.embedding_inputs = []
         self.caption_inputs = []
+        self.detail_inputs = []
         self.rerank_inputs = []
         self.rerank_limits = []
         self.fail_embedding = False
         self.fail_caption = False
+        self.fail_details = False
 
     async def close(self):
         pass
@@ -49,6 +51,12 @@ class FakeProviders:
             dtype=np.float32,
         )
         return matrix / np.linalg.norm(matrix, axis=1, keepdims=True)
+
+    async def image_details(self, url):
+        self.detail_inputs.append(url)
+        if self.fail_details:
+            raise ServiceError(502, 'vision_http_403')
+        return ['A red backpack.', 'Blue straps cross the front of the backpack.']
 
     async def rerank(self, query, candidates, limit):
         self.rerank_inputs.append((query, candidates))
@@ -325,7 +333,9 @@ def test_failed_write_is_not_acknowledged_or_searchable(client, backend):
     assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
 
 
-def test_history_images_do_not_require_vision_generation(client, backend):
+def test_history_images_keep_provided_caption_and_add_independent_details(
+    client, backend
+):
     backend.fail_caption = True
     content = [
         {'type': 'text', 'text': 'Provided caption: a blue bicycle.'},
@@ -334,10 +344,17 @@ def test_history_images_do_not_require_vision_generation(client, backend):
     result = client.post('/v1/memories/add', json=add_payload(content=content))
     assert result.status_code == 200
     assert not backend.caption_inputs
+    assert len(backend.detail_inputs) == 1
     assert any(
         'Provided caption: a blue bicycle.' in text for text in backend.embedding_inputs
     )
-    assert not any('Visual description:' in text for text in backend.embedding_inputs)
+    assert any(
+        'generated description]\nA red backpack.' in text
+        for text in backend.embedding_inputs
+    )
+    source = client.app.state.engine.store.messages('user-1', 'session-1')[0]
+    assert 'Provided caption: a blue bicycle.' in source['render']
+    assert 'Blue straps' not in source['render']
 
 
 def test_query_caption_failure_does_not_silently_drop_visual_retrieval(client, backend):
@@ -1168,6 +1185,235 @@ def test_empty_query_caption_fails_without_retrieval(client, backend):
     )
     assert response.status_code == 200
     assert len(backend.rerank_inputs) == 1
+
+
+def test_image_views_keep_exact_picture_and_message_binding(client, backend):
+    red, blue = image_url('red'), image_url('blue')
+    content = [
+        {'type': 'text', 'text': 'First provided caption.'},
+        image_part(red),
+        {'type': 'text', 'text': 'Second provided caption.'},
+        image_part(blue),
+    ]
+    payload = add_payload(content=content)
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    store = client.app.state.engine.store
+    source = store.messages('user-1', 'session-1')[0]
+    parts = json.loads(source['content'])
+    with store.connection() as connection:
+        rows = [dict(row) for row in connection.execute('SELECT * FROM image_views')]
+    assert len(rows) == 6
+    assert {row['message_id'] for row in rows} == {source['message_id']}
+    provided = {
+        row['image_hash']: row['content'] for row in rows if row['kind'] == 'provided'
+    }
+    assert 'First provided caption.' in provided[parts[1]['hash']]
+    assert 'Second provided caption.' not in provided[parts[1]['hash']]
+    assert 'Second provided caption.' in provided[parts[3]['hash']]
+    assert 'First provided caption.' not in provided[parts[3]['hash']]
+    assert backend.detail_inputs == [red, blue]
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    assert backend.detail_inputs == [red, blue]
+    result = client.post('/v1/memories/search', json=search_payload()).json()['data']
+    assert len(result) == 1
+    assert [
+        part['image_url']['url']
+        for part in result[0]['content']
+        if part['type'] == 'image_url'
+    ] == [red, blue]
+    assert not any(
+        'Blue straps' in part.get('text', '') for part in result[0]['content']
+    )
+
+
+def test_each_image_view_can_retrieve_but_sibling_views_have_one_candidate(
+    client, backend
+):
+    async def details(url):
+        return ['Red straps.', 'Blue buckles.', 'Paris is readable on the label.']
+
+    backend.image_details = details
+    content = [{'type': 'text', 'text': 'An original travel photograph.'}, image_part()]
+    assert (
+        client.post('/v1/memories/add', json=add_payload(content=content)).status_code
+        == 200
+    )
+    engine = client.app.state.engine
+    for query in ['red', 'blue', 'paris']:
+        vector = np.asarray(
+            [1, int(query == 'red'), int(query == 'blue'), int(query == 'paris')],
+            dtype=np.float32,
+        )
+        vector /= np.linalg.norm(vector)
+        candidates = engine.store.candidates('user-1', vector, 128)
+        image_candidates = [row for row in candidates if row.get('image_hash')]
+        assert len(image_candidates) == 1
+        assert query in image_candidates[0]['content'].lower()
+    vector = np.asarray([1, 0, 0, 0], dtype=np.float32)
+    candidates = engine.store.candidates('user-1', vector, 128)
+    assert (
+        'original travel photograph'
+        in next(row for row in candidates if row.get('image_hash'))['content']
+    )
+    assert engine.store.candidates('other-user', vector, 128) == []
+    before = len(backend.rerank_inputs)
+    reply = client.post(
+        '/v1/memories/search', json=search_payload(query=[image_part()])
+    )
+    assert reply.status_code == 200
+    assert len(reply.json()['data']) == 1
+    assert len(backend.rerank_inputs) - before == 1
+
+
+def test_image_fusion_preserves_two_matched_views_without_extra_rrf_votes(client):
+    engine = client.app.state.engine
+    first = {
+        'chunk_id': 'image-group',
+        'image_hash': 'pixels',
+        'content': 'red straps',
+        'source_ids': ['source'],
+    }
+    second = {**first, 'content': 'blue buckles'}
+    fused = engine._fuse_candidates([[first, first], [second]])
+    assert len(fused) == 1
+    assert fused[0]['score'] == pytest.approx(2 / 61)
+    assert 'red straps' in fused[0]['content'] and 'blue buckles' in fused[0]['content']
+    assert first['content'] == 'red straps'
+
+
+def test_history_details_failure_does_not_commit_partial_memory(client, backend):
+    backend.fail_details = True
+    payload = add_payload(content=[image_part()])
+    assert client.post('/v1/memories/add', json=payload).status_code == 502
+    store = client.app.state.engine.store
+    with store.connection() as connection:
+        for table in ['messages', 'requests', 'media', 'chunks', 'image_views']:
+            assert (
+                connection.execute(f'SELECT count(*) FROM {table}').fetchone()[0] == 0
+            )
+    backend.fail_details = False
+    backend.fail_embedding = True
+    assert client.post('/v1/memories/add', json=payload).status_code == 502
+    assert store.messages('user-1', 'session-1') == []
+    backend.fail_embedding = False
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    assert len(backend.detail_inputs) == 2
+
+
+def test_history_details_cache_survives_append_and_restart_and_is_user_scoped(settings):
+    first = FakeProviders()
+    payload = add_payload(content=[image_part()])
+    with TestClient(create_app(settings, first)) as instance:
+        instance.headers['Authorization'] = 'Token ' + settings.api_token
+        assert instance.post('/v1/memories/add', json=payload).status_code == 200
+        assert (
+            instance.post(
+                '/v1/memories/add', json=add_payload(request='second')
+            ).status_code
+            == 200
+        )
+        with instance.app.state.engine.store.connection() as connection:
+            assert (
+                connection.execute('SELECT count(*) FROM image_views').fetchone()[0]
+                == 2
+            )
+    second = FakeProviders()
+    with TestClient(create_app(settings, second)) as instance:
+        instance.headers['Authorization'] = 'Token ' + settings.api_token
+        assert (
+            instance.post(
+                '/v1/memories/add', json={**payload, 'request_id': 'third'}
+            ).status_code
+            == 200
+        )
+        assert not second.detail_inputs
+        assert (
+            instance.post(
+                '/v1/memories/add', json={**payload, 'user_id': 'other'}
+            ).status_code
+            == 200
+        )
+        assert len(second.detail_inputs) == 1
+        store = instance.app.state.engine.store
+        store.purge_user('user-1')
+        with store.connection() as connection:
+            rows = connection.execute('SELECT user_id FROM image_views').fetchall()
+            assert len(rows) == 2 and {row['user_id'] for row in rows} == {'other'}
+
+
+@pytest.mark.parametrize(
+    'descriptions', [[], ['A red backpack.', ' A  RED backpack. ']]
+)
+def test_empty_or_duplicate_generated_descriptions_are_bounded(
+    client, backend, descriptions
+):
+    async def details(url):
+        return descriptions
+
+    backend.image_details = details
+    payload = add_payload(
+        content=[{'type': 'text', 'text': 'Supplied caption.'}, image_part()]
+    )
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    with client.app.state.engine.store.connection() as connection:
+        rows = connection.execute('SELECT kind FROM image_views').fetchall()
+    assert len(rows) == (1 if not descriptions else 2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'value,finish,valid',
+    [
+        ({'descriptions': ['Red straps.', 'Blue buckles.']}, 'stop', True),
+        ({'descriptions': []}, 'stop', True),
+        ({'descriptions': ['same', ' SAME ']}, 'stop', True),
+        ({'descriptions': ['text']}, 'length', False),
+        ({'descriptions': ['text']}, 'content_filter', False),
+        ({}, 'stop', False),
+        ({'descriptions': 'not a list'}, 'stop', False),
+        ({'descriptions': [None]}, 'stop', False),
+        ({'descriptions': ['']}, 'stop', False),
+        ({'descriptions': ['x' * 1201]}, 'stop', False),
+        ({'descriptions': ['one', 'two', 'three', 'four', 'five']}, 'stop', False),
+        ('not json', 'stop', False),
+    ],
+)
+async def test_image_details_provider_validates_grounded_multi_view_json(
+    settings, value, finish, valid
+):
+    provider = Providers(settings)
+    recorded = []
+
+    async def response(name, url, key, payload):
+        recorded.append(payload)
+        return {
+            'choices': [
+                {
+                    'finish_reason': finish,
+                    'message': {
+                        'content': (
+                            json.dumps(value) if isinstance(value, dict) else value
+                        )
+                    },
+                }
+            ]
+        }
+
+    provider._post = response
+    try:
+        if valid:
+            result = await provider.image_details(image_url())
+            assert len(result) <= 4
+            assert len(result) == len(set(text.casefold() for text in result))
+        else:
+            with pytest.raises(ServiceError, match='vision_invalid_image_details'):
+                await provider.image_details(image_url())
+        assert len(recorded) == 1
+        assert recorded[0]['model'] == 'gpt-4o-mini'
+        assert recorded[0]['response_format'] == {'type': 'json_object'}
+        assert recorded[0]['messages'][1]['content'][1]['image_url']['detail'] == 'high'
+    finally:
+        await provider.close()
 
 
 def test_new_caption_protocol_rejects_a_legacy_data_directory(settings):

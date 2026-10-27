@@ -46,6 +46,8 @@ class Store:
                     CREATE TABLE IF NOT EXISTS messages (message_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, content TEXT NOT NULL, render TEXT NOT NULL, role TEXT NOT NULL, timestamp INTEGER, UNIQUE(user_id,session_id,ordinal));
                     CREATE TABLE IF NOT EXISTS chunks (chunk_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, content TEXT NOT NULL, source_ids TEXT NOT NULL, vector BLOB NOT NULL, dimensions INTEGER NOT NULL);
                     CREATE INDEX IF NOT EXISTS chunks_user ON chunks(user_id);
+                    CREATE TABLE IF NOT EXISTS image_views (view_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, image_hash TEXT NOT NULL, kind TEXT NOT NULL, ordinal INTEGER NOT NULL, content TEXT NOT NULL, vector BLOB NOT NULL, dimensions INTEGER NOT NULL);
+                    CREATE INDEX IF NOT EXISTS image_views_user ON image_views(user_id,message_id,image_hash,ordinal);
                     CREATE TABLE IF NOT EXISTS media (user_id TEXT, hash TEXT, mime TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(user_id,hash));
                     CREATE TABLE IF NOT EXISTS captions (user_id TEXT, hash TEXT, text TEXT NOT NULL, PRIMARY KEY(user_id,hash));
                     CREATE TABLE IF NOT EXISTS embeddings (user_id TEXT, hash TEXT, vector BLOB NOT NULL, dimensions INTEGER NOT NULL, PRIMARY KEY(user_id,hash));
@@ -147,7 +149,7 @@ class Store:
             ).fetchone()
         return np.frombuffer(row['vector'], dtype='<f4').copy() if row else None
 
-    def commit(self, request, payload_hash, messages, chunks, media):
+    def commit(self, request, payload_hash, messages, chunks, media, image_views=()):
         response = {
             'success': True,
             'request_id': request.request_id,
@@ -199,6 +201,24 @@ class Store:
                         for position, row in enumerate(chunks)
                     ],
                 )
+                connection.executemany(
+                    'INSERT INTO image_views VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    [
+                        (
+                            row['view_id'],
+                            request.user_id,
+                            request.session_id,
+                            row['message_id'],
+                            row['image_hash'],
+                            row['kind'],
+                            row['ordinal'],
+                            row['content'],
+                            np.asarray(row['vector'], dtype='<f4').tobytes(),
+                            len(row['vector']),
+                        )
+                        for row in image_views
+                    ],
+                )
                 connection.execute(
                     'INSERT INTO requests (user_id,request_id,payload_hash,response) VALUES (?,?,?,?)',
                     (
@@ -216,6 +236,13 @@ class Store:
 
     def candidates(self, user, vector, count):
         selected = []
+
+        def select(item):
+            if len(selected) < count:
+                heapq.heappush(selected, item)
+            elif item > selected[0]:
+                heapq.heapreplace(selected, item)
+
         with self.connection() as connection:
             cursor = connection.execute(
                 'SELECT chunk_id,session_id,content,source_ids,vector,dimensions FROM chunks WHERE user_id=?',
@@ -235,11 +262,39 @@ class Store:
                         row['session_id'],
                         row['content'],
                         row['source_ids'],
+                        '',
                     )
-                    if len(selected) < count:
-                        heapq.heappush(selected, item)
-                    elif item > selected[0]:
-                        heapq.heapreplace(selected, item)
+                    select(item)
+            cursor = connection.execute(
+                'SELECT * FROM image_views WHERE user_id=? ORDER BY message_id,image_hash,ordinal',
+                (user,),
+            )
+            group = None
+            best = None
+            while rows := cursor.fetchmany(256):
+                if any(row['dimensions'] != len(vector) for row in rows):
+                    raise ServiceError(502, 'embedding_dimension_changed')
+                matrix = np.stack(
+                    [np.frombuffer(row['vector'], dtype='<f4') for row in rows]
+                )
+                for row, score in zip(rows, matrix @ vector):
+                    current = (row['message_id'], row['image_hash'])
+                    if current != group:
+                        if best is not None:
+                            select(best)
+                        group, best = current, None
+                    item = (
+                        float(score),
+                        digest(('image', user, *current)),
+                        row['session_id'],
+                        row['content'],
+                        json.dumps([row['message_id']]),
+                        row['image_hash'],
+                    )
+                    if best is None or item[0] > best[0]:
+                        best = item
+            if best is not None:
+                select(best)
         return [
             {
                 'score': score,
@@ -247,8 +302,9 @@ class Store:
                 'session_id': session,
                 'content': content,
                 'source_ids': json.loads(source_ids),
+                **({'image_hash': image_hash} if image_hash else {}),
             }
-            for score, chunk_id, session, content, source_ids in sorted(
+            for score, chunk_id, session, content, source_ids, image_hash in sorted(
                 selected, reverse=True
             )
         ]
@@ -283,6 +339,7 @@ class Store:
                     'requests',
                     'messages',
                     'chunks',
+                    'image_views',
                     'media',
                     'captions',
                     'embeddings',

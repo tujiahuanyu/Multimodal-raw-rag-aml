@@ -150,6 +150,7 @@ def prepare(arguments):
         {
             'scenario': conversation.conversation_id,
             'history_caption_source': 'dataset',
+            'history_generated_details': 'generated_on_add',
             'query_caption_source': 'generated_on_search',
             'adds': batches,
             'searches': searches,
@@ -201,7 +202,7 @@ def run(arguments):
     )
     report = {
         'scenario': bundle['scenario'],
-        'protocol': 'Public-data diagnostic retrieval smoke with provided history captions and query-image captioning; no answers or gold evidence sent to retrieval; not official scoring',
+        'protocol': 'Public-data diagnostic retrieval smoke with provided history captions, generated history-image detail views and query-image captioning; no answers or gold evidence sent to retrieval; not official scoring',
         'adds': [],
         'searches': [],
         'passed': False,

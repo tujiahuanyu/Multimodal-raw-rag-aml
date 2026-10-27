@@ -11,7 +11,7 @@ import warnings
 from PIL import Image
 import tiktoken
 
-from .providers import ServiceError
+from .providers import ServiceError, image_descriptions
 from .store import digest
 
 
@@ -84,6 +84,71 @@ class Engine:
                 vectors[position] = vector
         return vectors
 
+    async def _image_details(self, user, key, url):
+        cache_key = digest(('history_details_v1', key))
+        cached = self.store.caption(user, cache_key)
+        if cached is not None:
+            return image_descriptions(json.loads(cached))
+        descriptions = image_descriptions(await self.providers.image_details(url))
+        self.store.caption(
+            user, cache_key, json.dumps(descriptions, ensure_ascii=False)
+        )
+        return descriptions
+
+    def _provided_image_texts(self, content):
+        supplied = {}
+        pending = []
+        previous_image = False
+        for part in content:
+            if part['type'] == 'text':
+                if previous_image:
+                    pending = []
+                pending.append(part['text'])
+                previous_image = False
+            else:
+                if pending:
+                    supplied.setdefault(part['hash'], []).append('\n'.join(pending))
+                previous_image = True
+        keys = {part['hash'] for part in content if part['type'] == 'image'}
+        if len(keys) == 1 and not supplied:
+            texts = [part['text'] for part in content if part['type'] == 'text']
+            if texts:
+                supplied[next(iter(keys))] = ['\n'.join(texts)]
+        return supplied
+
+    async def _image_views(self, user, message, content, images):
+        supplied = self._provided_image_texts(content)
+        views = []
+        seen_images = set()
+        for key, mime, data, url in images:
+            if key in seen_images:
+                continue
+            seen_images.add(key)
+            descriptions = await self._image_details(user, key, url)
+            entries = [('provided', text) for text in supplied.get(key, [])]
+            entries.extend(('generated', text) for text in descriptions)
+            seen_texts = set()
+            for kind, text in entries:
+                normalized = ' '.join(text.casefold().split())
+                if normalized in seen_texts:
+                    continue
+                seen_texts.add(normalized)
+                ordinal = len(views)
+                views.append(
+                    {
+                        'view_id': digest((message['message_id'], key, kind, text)),
+                        'message_id': message['message_id'],
+                        'image_hash': key,
+                        'kind': kind,
+                        'ordinal': ordinal,
+                        'content': f'[Image img_{key[:16]} | {kind} description]\n{text}',
+                    }
+                )
+        vectors = await self._vectors(user, [row['content'] for row in views])
+        for row, vector in zip(views, vectors):
+            row['vector'] = vector
+        return views
+
     def _normalize(self, content):
         if isinstance(content, str):
             if not content.strip():
@@ -120,6 +185,7 @@ class Engine:
             existing = self.store.messages(request.user_id, request.session_id)
             added = []
             media = {}
+            image_views = []
             for position, (message, (content, images, size)) in enumerate(
                 zip(request.messages, normalized)
             ):
@@ -161,13 +227,21 @@ class Engine:
                         'timestamp': message.timestamp,
                     }
                 )
+                if images:
+                    image_views.extend(
+                        await self._image_views(
+                            request.user_id, added[-1], content, images
+                        )
+                    )
             chunks = self._chunks(request.user_id, request.session_id, existing + added)
             vectors = await self._vectors(
                 request.user_id, [row['content'] for row in chunks]
             )
             for row, vector in zip(chunks, vectors):
                 row['vector'] = vector
-            return self.store.commit(request, payload_hash, added, chunks, media)
+            return self.store.commit(
+                request, payload_hash, added, chunks, media, image_views
+            )
 
     def _chunks(self, user, session, messages):
         document = '\n'.join(row['render'] for row in messages)
@@ -281,7 +355,16 @@ class Engine:
                 if identifier in seen:
                     continue
                 seen.add(identifier)
-                candidates.setdefault(identifier, candidate)
+                if identifier not in candidates:
+                    candidates[identifier] = dict(candidate)
+                elif candidate.get('image_hash'):
+                    previous = candidates[identifier]['content']
+                    if candidate['content'] not in previous.split(
+                        '\nAdditional matched view:\n'
+                    ):
+                        candidates[identifier]['content'] += (
+                            '\nAdditional matched view:\n' + candidate['content']
+                        )
                 scores[identifier] = scores.get(identifier, 0) + 1 / (60 + rank)
         identifiers = sorted(candidates, key=lambda identifier: -scores[identifier])
         return [
