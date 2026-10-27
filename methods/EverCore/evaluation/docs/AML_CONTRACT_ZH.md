@@ -14,7 +14,7 @@
 | Search 包含原始 query、user_id、top_k，选择题 options 单独放顶层 | POST /v1/memories/search，支持文字和有序图文 query |
 | 按 user_id 隔离，不能跨样本共享状态 | 记忆和派生缓存均按用户隔离；session_id 用于组织，不限制跨会话检索 |
 | 响应为 data 数组，条目有稳定 id、非空 content，按相关性排序 | 返回原始来源证据，包含可选 score 和来源时间 |
-| 数量不得超过 top_k，正式评测 top_k=100 | 固定最多重排返回 15 条，同时不超过调用方 top_k；空结果为 data=[] |
+| 数量不得超过 top_k，正式评测 top_k=100 | 一次重排全部召回 chunk，按顺序展开并按原始消息 ID 去重，再选最多 min(top_k, 15) 条完整消息；空结果为 data=[] |
 | 多模态保持 text/image_url 顺序，只接受内联 Base64 | 存储并返回原始图片，不以图片网址代替，不静默缩放 |
 | JPEG/PNG/WebP，单图片解码不超过 10 MiB | 校验实际格式、MIME 和体积，明确拒绝不支持的输入 |
 | Add 总媒体不超过 30 MiB，Search 响应总媒体不超过 30 MiB | 校验 Add；Search 按预算选择完整证据条目，不裁剪单个证据 |
@@ -52,6 +52,8 @@ python -m evaluation.src.aml.contract_smoke \
 
 本轮修复：即使 user_id 尚无记忆或 top_k=0，也先校验查询内容，非法图片和空白查询
 返回 422，而不是悄悄返回成功空结果。来源与方法改动见 [披露说明](METHOD_DISCLOSURE_ZH.md)。
+2026-10-27 的 v1.1 源码新增一次重排后的完整消息去重及后置限额；旧核查报告记录的是此前版本，
+不能将旧公网测试或平台 v1.0 Smoke 成绩作为新流程的测试结果。
 
 ## 仍需完成的运营与平台条件
 

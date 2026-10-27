@@ -131,7 +131,7 @@ def create_app(settings, providers=None):
 
     @app.get('/health')
     async def health():
-        return {'status': 'ok', 'version': 'raw-rag-aml-v1'}
+        return {'status': 'ok', 'version': 'raw-rag-aml-v1.1'}
 
     @app.post('/v1/memories/add')
     async def add(payload: AddRequest):

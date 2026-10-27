@@ -19,6 +19,7 @@ class FakeProviders:
         self.embedding_inputs = []
         self.caption_inputs = []
         self.rerank_inputs = []
+        self.rerank_limits = []
         self.fail_embedding = False
         self.fail_caption = False
 
@@ -51,6 +52,7 @@ class FakeProviders:
 
     async def rerank(self, query, candidates, limit):
         self.rerank_inputs.append((query, candidates))
+        self.rerank_limits.append(limit)
         return [
             {**row, 'score': 1 - position / max(1, len(candidates))}
             for position, row in enumerate(candidates[:limit])
@@ -210,12 +212,10 @@ def test_incremental_append_reuses_closed_window_embeddings(client, backend):
     )
     assert reply.status_code == 200
     assert previous[0] not in backend.embedding_inputs[len(previous) :]
-    assert (
-        'blue'
-        in client.post('/v1/memories/search', json=search_payload(query='blue')).json()[
-            'data'
-        ][0]['content']
-    )
+    evidence = client.post(
+        '/v1/memories/search', json=search_payload(query='blue')
+    ).json()['data']
+    assert any('blue' in row['content'] for row in evidence)
 
 
 def test_multimodal_parts_preserve_pixels_order_and_source_binding(client, backend):
@@ -613,6 +613,373 @@ def test_search_media_budget_preserves_complete_candidates(settings):
         assert response.status_code == 200
         assert len(response.json()['data']) == 1
         assert response.json()['data'][0]['content'][1:] == [image_part(url)]
+
+
+@pytest.mark.parametrize(
+    'source_type', ['email', 'image', 'video_text', 'video_frames']
+)
+def test_atm_sources_in_aml_envelope_preserve_evidence(client, backend, source_type):
+    metadata = {
+        'timestamp': '2024-01-01 00:00:00',
+        'location_name': 'Paris',
+        'short_caption': 'A red backpack at a station.',
+        'caption': 'A red backpack beside a departure board.',
+        'ocr_text': 'Platform 7, 09:45',
+        'tags': ['backpack', 'station'],
+    }
+    if source_type == 'email':
+        metadata = {
+            'id': 'email202401010001',
+            'timestamp': metadata['timestamp'],
+            'short_summary': 'Paris train booking',
+            'detail': 'Bring the red backpack. Departure: platform 7 at 09:45.',
+        }
+        content = json.dumps(metadata)
+    else:
+        metadata['image_path' if source_type == 'image' else 'video_path'] = (
+            '20240101_000000.jpg' if source_type == 'image' else '20240101_000000.mp4'
+        )
+        content = [{'type': 'text', 'text': json.dumps(metadata)}]
+        if source_type == 'image':
+            content.append(image_part(image_url('red')))
+        elif source_type == 'video_frames':
+            content.extend(
+                [
+                    {'type': 'text', 'text': 'Frame timestamp: 00:00:01.000'},
+                    image_part(image_url('red')),
+                    {'type': 'text', 'text': 'Frame timestamp: 00:00:02.000'},
+                    image_part(image_url('blue')),
+                ]
+            )
+    payload = add_payload(session='atm-' + source_type, content=content)
+    response = client.post('/v1/memories/add', json=payload)
+    assert response.status_code == 200
+    messages = client.app.state.engine.store.messages('user-1', payload['session_id'])
+    assert len(messages) == 1
+    assert all(
+        str(value) in messages[0]['render']
+        for value in metadata.values()
+        if isinstance(value, str)
+    )
+    assert all(
+        any(value in text for text in backend.embedding_inputs)
+        for value in metadata.values()
+        if isinstance(value, str)
+    )
+    response = client.post(
+        '/v1/memories/search', json=search_payload(query='Paris station')
+    )
+    assert response.status_code == 200
+    evidence = response.json()['data']
+    assert evidence
+    for row in evidence:
+        assert row['created_at'] == '2024-01-01T00:00:00+00:00'
+        if isinstance(content, str):
+            assert row['content'].endswith(content)
+        else:
+            assert row['content'][1:] == content
+    assert len(backend.caption_inputs) == {'image': 1, 'video_frames': 2}.get(
+        source_type, 0
+    )
+
+
+def test_raw_video_is_rejected_without_model_calls(client, backend):
+    content = [
+        {'type': 'video_url', 'video_url': {'url': 'data:video/mp4;base64,YWJj'}}
+    ]
+    response = client.post('/v1/memories/add', json=add_payload(content=content))
+    assert response.status_code == 422
+    assert not backend.caption_inputs
+    assert not backend.embedding_inputs
+    assert not backend.rerank_inputs
+
+
+def test_expanded_long_message_is_deduplicated_after_single_rerank(client, backend):
+    content = 'The red camera was bought in Paris. ' * 600
+    assert (
+        client.post('/v1/memories/add', json=add_payload(content=content)).status_code
+        == 200
+    )
+    response = client.post('/v1/memories/search', json=search_payload())
+    assert response.status_code == 200
+    assert len(backend.rerank_inputs) == 1
+    assert len(backend.rerank_inputs[0][1]) > 1
+    assert backend.rerank_limits == [len(backend.rerank_inputs[0][1])]
+    evidence = response.json()['data']
+    assert len(evidence) == 1
+    assert evidence[0]['content'].endswith(content)
+    message = client.app.state.engine.store.messages('user-1', 'session-1')[0]
+    assert evidence[0]['id'] == message['message_id']
+
+
+def test_partially_overlapping_chunks_expand_to_each_message_once(
+    client, backend, monkeypatch
+):
+    payload = add_payload()
+    payload['messages'] = [
+        {'role': 'user', 'content': 'First complete source.'},
+        {'role': 'assistant', 'content': 'Second complete source.'},
+        {'role': 'user', 'content': 'Third complete source.'},
+    ]
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    store = client.app.state.engine.store
+    messages = store.messages('user-1', 'session-1')
+    identifiers = [row['message_id'] for row in messages]
+    candidates = [
+        {
+            'chunk_id': 'first',
+            'content': 'First fragment',
+            'source_ids': identifiers[:2],
+        },
+        {
+            'chunk_id': 'second',
+            'content': 'Second fragment',
+            'source_ids': identifiers[1:],
+        },
+        {
+            'chunk_id': 'third',
+            'content': 'Third fragment',
+            'source_ids': identifiers[:1],
+        },
+    ]
+    monkeypatch.setattr(store, 'candidates', lambda *arguments: candidates)
+    response = client.post('/v1/memories/search', json=search_payload())
+    assert response.status_code == 200
+    assert len(backend.rerank_inputs) == 1
+    assert backend.rerank_limits == [len(candidates)]
+    evidence = response.json()['data']
+    assert [row['id'] for row in evidence] == identifiers
+    assert evidence[0]['score'] == evidence[1]['score'] == 1
+    assert evidence[2]['score'] == 1 - 1 / len(candidates)
+    for original in payload['messages']:
+        assert sum(row['content'].count(original['content']) for row in evidence) == 1
+
+
+@pytest.mark.parametrize('sessions', [['first', 'second'], ['same', 'same']])
+def test_equal_text_from_distinct_source_messages_is_not_deduplicated(
+    client, backend, sessions
+):
+    content = 'I took a red backpack to Paris.'
+    for position, session in enumerate(sessions):
+        payload = add_payload(request=str(position), session=session, content=content)
+        payload['messages'][0]['timestamp'] += position * 86400000
+        assert client.post('/v1/memories/add', json=payload).status_code == 200
+    response = client.post('/v1/memories/search', json=search_payload())
+    assert response.status_code == 200
+    evidence = response.json()['data']
+    assert len(evidence) == 2
+    assert len({row['id'] for row in evidence}) == 2
+    assert len({row['created_at'] for row in evidence}) == 2
+    assert all(row['content'].endswith(content) for row in evidence)
+    assert len(backend.rerank_inputs) == 1
+
+
+def test_source_id_stays_stable_after_session_rechunking(client):
+    content = 'red camera in Paris ' * 300
+    assert (
+        client.post('/v1/memories/add', json=add_payload(content=content)).status_code
+        == 200
+    )
+    first = client.post('/v1/memories/search', json=search_payload()).json()['data']
+    assert len(first) == 1
+    assert (
+        client.post(
+            '/v1/memories/add',
+            json=add_payload(request='append', content='blue ' * 300),
+        ).status_code
+        == 200
+    )
+    second = client.post('/v1/memories/search', json=search_payload()).json()['data']
+    original = [row for row in second if row['id'] == first[0]['id']]
+    assert len(original) == 1
+    assert original[0]['content'] == first[0]['content']
+
+
+def test_single_chunk_rerank_determines_source_order_and_scores(
+    client, backend, monkeypatch
+):
+    payload = add_payload()
+    payload['messages'] = [
+        {'role': 'user', 'content': 'First complete source.'},
+        {'role': 'assistant', 'content': 'Second complete source.'},
+    ]
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    store = client.app.state.engine.store
+    messages = store.messages('user-1', 'session-1')
+    monkeypatch.setattr(
+        store,
+        'candidates',
+        lambda *arguments: [
+            {
+                'chunk_id': 'first-chunk',
+                'content': 'First fragment.',
+                'source_ids': [messages[0]['message_id']],
+            },
+            {
+                'chunk_id': 'second-chunk',
+                'content': 'Second fragment.',
+                'source_ids': [messages[1]['message_id']],
+            },
+        ],
+    )
+
+    async def rerank(query, candidates, limit):
+        backend.rerank_inputs.append((query, candidates))
+        assert limit == 2
+        assert [row['content'] for row in candidates] == [
+            'First fragment.',
+            'Second fragment.',
+        ]
+        return [{**candidates[1], 'score': 0.42}, {**candidates[0], 'score': 0.1}]
+
+    backend.rerank = rerank
+    response = client.post('/v1/memories/search', json={**search_payload(), 'top_k': 1})
+    assert response.status_code == 200
+    evidence = response.json()['data']
+    assert len(evidence) == 1
+    assert evidence[0]['id'] == messages[1]['message_id']
+    assert evidence[0]['content'].endswith('Second complete source.')
+    assert evidence[0]['score'] == 0.42
+    assert len(backend.rerank_inputs) == 1
+
+
+@pytest.mark.parametrize('top_k', [1, 3, 15, 100])
+def test_message_dedup_backfills_beyond_fifteenth_ranked_chunk(
+    client, backend, monkeypatch, top_k
+):
+    payload = add_payload()
+    payload['messages'] = [
+        {'role': 'user', 'content': f'Complete source number {position}.'}
+        for position in range(15)
+    ]
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    store = client.app.state.engine.store
+    messages = store.messages('user-1', 'session-1')
+    candidates = [
+        {
+            'chunk_id': f'repeat-{position}',
+            'content': 'A fragment of the first source.',
+            'source_ids': [messages[0]['message_id']],
+        }
+        for position in range(20)
+    ] + [
+        {
+            'chunk_id': f'other-{position}',
+            'content': 'A fragment of another source.',
+            'source_ids': [message['message_id']],
+        }
+        for position, message in enumerate(messages[1:])
+    ]
+    monkeypatch.setattr(store, 'candidates', lambda *arguments: candidates)
+    response = client.post(
+        '/v1/memories/search', json={**search_payload(), 'top_k': top_k}
+    )
+    assert response.status_code == 200
+    assert len(backend.rerank_inputs) == 1
+    assert backend.rerank_limits == [34]
+    evidence = response.json()['data']
+    expected = min(top_k, 15)
+    assert len(evidence) == expected
+    assert [row['id'] for row in evidence] == [
+        row['message_id'] for row in messages[:expected]
+    ]
+    assert evidence[0]['score'] == 1
+    if expected > 1:
+        assert evidence[1]['score'] == 1 - 20 / len(candidates)
+    assert all(
+        row['content'].endswith(original['content'])
+        for row, original in zip(evidence, payload['messages'])
+    )
+
+
+def test_message_dedup_backfills_after_over_budget_source(settings, monkeypatch):
+    backend = FakeProviders()
+    url = image_url()
+    size = len(base64.b64decode(url.split(',', 1)[1]))
+    with TestClient(create_app(settings, backend)) as client:
+        client.headers['Authorization'] = 'Token ' + settings.api_token
+        assert (
+            client.post(
+                '/v1/memories/add',
+                json=add_payload(content=[image_part(url), image_part(url)]),
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                '/v1/memories/add',
+                json=add_payload(
+                    request='second',
+                    session='second',
+                    content='A complete text source.',
+                ),
+            ).status_code
+            == 200
+        )
+        engine = client.app.state.engine
+        first = engine.store.messages('user-1', 'session-1')[0]
+        second = engine.store.messages('user-1', 'second')[0]
+        monkeypatch.setattr(
+            engine, 'settings', replace(settings, result_count=1, max_media_bytes=size)
+        )
+        monkeypatch.setattr(
+            engine.store,
+            'candidates',
+            lambda *arguments: [
+                {
+                    'chunk_id': 'large',
+                    'content': 'Image fragments.',
+                    'source_ids': [first['message_id']],
+                },
+                {
+                    'chunk_id': 'small',
+                    'content': 'Text fragment.',
+                    'source_ids': [second['message_id']],
+                },
+            ],
+        )
+        response = client.post('/v1/memories/search', json=search_payload())
+        assert response.status_code == 200
+        assert len(response.json()['data']) == 1
+        assert response.json()['data'][0]['id'] == second['message_id']
+        assert response.json()['data'][0]['content'].endswith('A complete text source.')
+        assert backend.rerank_limits == [2]
+
+
+def test_multimodal_message_dedup_preserves_all_original_parts(client, backend):
+    parts = [
+        {'type': 'text', 'text': 'red backpack in Paris ' * 600},
+        image_part(),
+        {'type': 'text', 'text': 'The same image appears again within this message.'},
+        image_part(),
+    ]
+    assert (
+        client.post('/v1/memories/add', json=add_payload(content=parts)).status_code
+        == 200
+    )
+    response = client.post('/v1/memories/search', json=search_payload())
+    assert response.status_code == 200
+    assert len(backend.rerank_inputs) == 1
+    assert backend.rerank_limits == [len(backend.rerank_inputs[0][1])]
+    evidence = response.json()['data']
+    assert len(evidence) == 1
+    assert evidence[0]['content'][1:] == parts
+
+
+def test_single_rerank_failure_does_not_return_unranked_or_duplicate_sources(
+    client, backend
+):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+
+    async def rerank(query, candidates, limit):
+        backend.rerank_inputs.append((query, candidates))
+        raise ServiceError(502, 'rerank_http_429')
+
+    backend.rerank = rerank
+    response = client.post('/v1/memories/search', json=search_payload())
+    assert response.status_code == 502
+    assert response.json() == {'error': 'rerank_http_429'}
+    assert len(backend.rerank_inputs) == 1
 
 
 def test_over_capacity_returns_retry_after(settings):

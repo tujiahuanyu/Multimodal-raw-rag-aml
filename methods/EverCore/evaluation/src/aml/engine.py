@@ -238,18 +238,22 @@ class Engine:
                 vector,
                 self.settings.candidate_count,
             )
-            limit = min(request.top_k, self.settings.result_count, len(candidates))
-            if not limit:
+            if not candidates:
                 return {'data': []}
-            ranked = await self.providers.rerank(text, candidates, limit)
+            ranked_chunks = await self.providers.rerank(
+                text, candidates, len(candidates)
+            )
+            limit = min(request.top_k, self.settings.result_count)
             output = []
             total_media = 0
-            for candidate in ranked:
+            for candidate in self._message_candidates(ranked_chunks):
                 result, image_bytes = self._evidence(request.user_id, candidate)
                 if total_media + image_bytes > self.settings.max_media_bytes:
                     continue
                 total_media += image_bytes
                 output.append(result)
+                if len(output) == limit:
+                    break
             if not output:
                 raise ServiceError(413, 'retrieved_evidence_exceeds_media_budget')
             result = {'data': output}
@@ -259,6 +263,19 @@ class Engine:
             ):
                 raise ServiceError(413, 'search_response_exceeds_service_limit')
             return result
+
+    def _message_candidates(self, candidates):
+        seen = set()
+        for candidate in candidates:
+            for identifier in candidate['source_ids']:
+                if identifier in seen:
+                    continue
+                seen.add(identifier)
+                yield {
+                    'chunk_id': identifier,
+                    'score': candidate['score'],
+                    'source_ids': [identifier],
+                }
 
     def _evidence(self, user, candidate):
         parts = []
