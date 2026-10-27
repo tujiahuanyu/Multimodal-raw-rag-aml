@@ -2,6 +2,7 @@ import argparse
 import base64
 from contextlib import contextmanager
 from datetime import timezone
+from itertools import zip_longest
 import json
 from pathlib import Path
 import re
@@ -61,23 +62,25 @@ def image_part(image):
 def prepare(arguments):
     from evaluation.src.multimodal.memgallery import load_memgallery
 
-    dataset = load_memgallery(arguments.data_root, scenario=arguments.scenario)
+    dataset = load_memgallery(
+        arguments.data_root, scenario=arguments.scenario, use_dataset_captions=True
+    )
     conversation = dataset.conversations[0]
     questions = dataset.qa_pairs
-    selected = []
-    for visual in [False, True]:
-        matching = next(
-            (
-                question
-                for question in questions
-                if bool(question.metadata['question_images']) == visual
-            ),
-            None,
-        )
-        if matching is not None:
-            selected.append(matching)
-    selected.extend(question for question in questions if question not in selected)
-    selected = selected[: arguments.questions]
+    groups = [
+        [
+            question
+            for question in questions
+            if bool(question.metadata['question_images']) == visual
+        ]
+        for visual in [False, True]
+    ]
+    selected = [
+        question
+        for pair in zip_longest(*groups)
+        for question in pair
+        if question is not None
+    ][: arguments.questions]
     user = 'memgallery-smoke:' + conversation.conversation_id
     batches = []
     current = None
@@ -86,7 +89,10 @@ def prepare(arguments):
     for message in conversation.messages:
         parts = [{'type': 'text', 'text': message.content}]
         images = message.metadata.get('images', [])
-        parts.extend(image_part(image) for image in images)
+        for image in images:
+            if image.get('caption'):
+                parts.append({'type': 'text', 'text': image['caption']})
+            parts.append(image_part(image))
         size = sum(Path(image['path']).stat().st_size for image in images)
         session = message.metadata['session']
         word_count = len(message.content.split())
@@ -143,6 +149,8 @@ def prepare(arguments):
         arguments.bundle,
         {
             'scenario': conversation.conversation_id,
+            'history_caption_source': 'dataset',
+            'query_caption_source': 'generated_on_search',
             'adds': batches,
             'searches': searches,
         },
@@ -193,7 +201,7 @@ def run(arguments):
     )
     report = {
         'scenario': bundle['scenario'],
-        'protocol': 'Three-question diagnostic retrieval smoke; full source history; no answers or gold evidence sent to retrieval; not official scoring',
+        'protocol': 'Public-data diagnostic retrieval smoke with provided history captions and query-image captioning; no answers or gold evidence sent to retrieval; not official scoring',
         'adds': [],
         'searches': [],
         'passed': False,

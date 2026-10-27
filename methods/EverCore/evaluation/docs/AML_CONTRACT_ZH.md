@@ -5,6 +5,10 @@
 本服务实现同步 Add/Search，Search 不生成最终答案；Answer/Eval 由平台完成。
 本轮实际结果与未完成项见 [2026-10-26 复查记录](AML_AUDIT_20261026_ZH.md)。
 
+版本说明：本页历史公网核验属于此前部署版本。当前 v1.2 试验代码改用传入的历史
+caption，并将原问题与查询图说明分路召回后融合；接口契约不变，但索引身份已改变，
+必须使用新的数据目录；线上版本以 /health 为准，详见 [v1.2 说明](PROVIDED_CAPTION_DUAL_QUERY_ZH.md)。
+
 | 官方要求 | 服务实现 |
 | --- | --- |
 | Add 接收 request_id、user_id、session_id、原始顺序的 messages | POST /v1/memories/add，保留原始标识和消息顺序 |
@@ -68,7 +72,9 @@ python -m evaluation.src.aml.contract_smoke \
 ## MemGallery 检查范围
 
 新增命令 `python -m evaluation.src.aml.memgallery_smoke prepare/run`。
-使用一个完整场景历史，按原始会话顺序分批 Add，再测试三个问题（包含图片查询）。
+使用一个完整场景历史和数据集提供的历史 caption，按原始会话顺序分批 Add；
+默认测试三个问题，按无图／有图交替选择，可通过 --questions 调整数量。
+不把查询图片的现成 caption 放入请求，Search 从查询图片生成说明。
 原始答案和 clue 不进入 Add 或 Search；clue 只在检索完成后计算诊断召回率。
 图片超过官方限制时明确报错，不默默缩放或跳过。
 测试数据包和参考标注分开保存，不让服务读取参考标注。

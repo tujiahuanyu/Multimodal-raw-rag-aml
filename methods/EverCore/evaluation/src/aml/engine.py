@@ -61,6 +61,9 @@ class Engine:
         text = self.store.caption(user, cache_key)
         if text is None:
             text = await self.providers.caption(url, context)
+            if not isinstance(text, str) or not text.strip():
+                raise ServiceError(502, 'empty_query_image_caption')
+            text = text.strip()
             self.store.caption(user, cache_key, text)
         return text
 
@@ -120,18 +123,7 @@ class Engine:
             for position, (message, (content, images, size)) in enumerate(
                 zip(request.messages, normalized)
             ):
-                text = (
-                    content
-                    if isinstance(content, str)
-                    else '\n'.join(
-                        part['text'] for part in content if part['type'] == 'text'
-                    )
-                )
-                visual = {}
                 for key, mime, data, url in images:
-                    visual[key] = await self._caption(
-                        request.user_id, key, url, text, 'history'
-                    )
                     media[key] = (mime, data)
                 moment = (
                     datetime.fromtimestamp(
@@ -148,7 +140,7 @@ class Engine:
                         lines.append(
                             part['text']
                             if part['type'] == 'text'
-                            else f"[Image img_{part['hash'][:16]}]\nVisual description: {visual[part['hash']]}"
+                            else f"[Image img_{part['hash'][:16]}]"
                         )
                 added.append(
                     {
@@ -226,22 +218,35 @@ class Engine:
                     part['text'] for part in content if part['type'] == 'text'
                 )
             )
+            descriptions = []
             for key, mime, data, url in images:
                 caption = await self._caption(request.user_id, key, url, '', 'query')
-                text += '\nQuery image description: ' + caption
+                descriptions.append(caption)
             if request.options:
                 text += '\nAnswer options:\n' + '\n'.join(request.options)
-            vector = (await self._vectors(request.user_id, [text]))[0]
-            candidates = await asyncio.to_thread(
-                self.store.candidates,
-                request.user_id,
-                vector,
-                self.settings.candidate_count,
+            description = '\n'.join(dict.fromkeys(descriptions))
+            queries = list(
+                dict.fromkeys(value for value in [text, description] if value.strip())
             )
+            vectors = await self._vectors(request.user_id, queries)
+            rankings = []
+            for vector in vectors:
+                rankings.append(
+                    await asyncio.to_thread(
+                        self.store.candidates,
+                        request.user_id,
+                        vector,
+                        self.settings.candidate_count,
+                    )
+                )
+            candidates = self._fuse_candidates(rankings)
             if not candidates:
                 return {'data': []}
+            rerank_query = text
+            if description:
+                rerank_query += '\nQuery image descriptions:\n' + description
             ranked_chunks = await self.providers.rerank(
-                text, candidates, len(candidates)
+                rerank_query, candidates, len(candidates)
             )
             limit = min(request.top_k, self.settings.result_count)
             output = []
@@ -263,6 +268,26 @@ class Engine:
             ):
                 raise ServiceError(413, 'search_response_exceeds_service_limit')
             return result
+
+    def _fuse_candidates(self, rankings):
+        if len(rankings) == 1:
+            return rankings[0][: self.settings.candidate_count]
+        candidates = {}
+        scores = {}
+        for ranking in rankings:
+            seen = set()
+            for rank, candidate in enumerate(ranking, 1):
+                identifier = candidate['chunk_id']
+                if identifier in seen:
+                    continue
+                seen.add(identifier)
+                candidates.setdefault(identifier, candidate)
+                scores[identifier] = scores.get(identifier, 0) + 1 / (60 + rank)
+        identifiers = sorted(candidates, key=lambda identifier: -scores[identifier])
+        return [
+            {**candidates[identifier], 'score': scores[identifier]}
+            for identifier in identifiers[: self.settings.candidate_count]
+        ]
 
     def _message_candidates(self, candidates):
         seen = set()

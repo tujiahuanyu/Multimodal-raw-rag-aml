@@ -9,12 +9,13 @@
 ## 方法
 
 - 原始历史切片 → 向量召回 → 一次 chunk 重排（保留全部候选排序）→ 展开完整原始消息 → 按消息 ID 去重 → 取前 15 条来源消息，返回原始文字与图片；Search 不生成最终答案。
-- 图片通过视觉描述参与文本向量检索，当前不使用直接图片向量检索。
+- Add 直接索引传入的原文与 caption，保留图片及文本块顺序，不再调用视觉模型生成历史图片说明。
+- 含图 Search 先描述查询图片，再用原始问题和图片描述独立向量召回，以 RRF 合并去重，之后只重排一次；当前不使用直接图片向量检索。
 - 默认模型：`gpt-4o-mini`、`text-embedding-v4`、`rerank-v3.5`。
-- 窗口 256 tokens，重叠 32 tokens，召回并重排最多 128 个候选，展开去重后再取最多 min(top_k, 15) 条消息；重复或超媒体预算时继续向后补足。
+- 窗口 256 tokens，重叠 32 tokens；每路召回最多 128 个候选，融合后最多重排 128 个候选，展开去重后再取最多 min(top_k, 15) 条消息；重复或超媒体预算时继续向后补足。
 - 比赛接口按 session 切片、按 user_id 隔离，支持同用户跨会话检索。
 - 新增 SQLite 持久化、幂等写入、访问认证及媒体校验。
-- 方法版本 `v1.1`。ATM 来源兼容范围、消息去重规则及测试边界见 [核查说明](methods/EverCore/evaluation/docs/ATM_AND_MESSAGE_DEDUP_ZH.md)。
+- 当前代码为 `v1.2`，不沿用此前版本的评测成绩；部署版本以 `/health` 为准。双路检索、caption 对应规则与验证结果见 [v1.2 说明](methods/EverCore/evaluation/docs/PROVIDED_CAPTION_DUAL_QUERY_ZH.md)。ATM 来源兼容范围及消息去重规则见 [核查说明](methods/EverCore/evaluation/docs/ATM_AND_MESSAGE_DEDUP_ZH.md)。
 
 ## 部署
 
@@ -31,6 +32,9 @@ chmod 600 .env.aml
 在 `.env.aml` 填写模型地址、模型 Key，以及至少 32 字符的随机 `AML_API_TOKEN`。
 `AML_API_TOKEN` 是本服务的访问密码。
 如重排需要代理，可设置 `RERANK_PROXY_URL`；请确保网络出口和模型额度持续可用。
+
+v1.2 改变历史索引文本及检索协议，必须使用全新 `--data-dir`，不能直接复用
+v1.1 的数据库或已有 Full 运行状态。服务会拒绝旧配置的数据目录，不自动删除数据。
 
 ```bash
 .venv/bin/python -m evaluation.src.aml serve \

@@ -236,8 +236,7 @@ def test_multimodal_parts_preserve_pixels_order_and_source_binding(client, backe
         0
     ]['content']
     assert result[1:] == content
-    assert len(backend.caption_inputs) == 2
-    assert backend.caption_inputs[0][1] == 'before\nbetween\nafter'
+    assert not backend.caption_inputs
     assert not any('answer' in str(item).lower() for item in result)
 
 
@@ -326,11 +325,35 @@ def test_failed_write_is_not_acknowledged_or_searchable(client, backend):
     assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
 
 
-def test_caption_failure_is_not_silently_replaced_by_text_only(client, backend):
+def test_history_images_do_not_require_vision_generation(client, backend):
     backend.fail_caption = True
-    result = client.post('/v1/memories/add', json=add_payload(content=[image_part()]))
-    assert result.status_code == 502
-    assert not backend.embedding_inputs
+    content = [
+        {'type': 'text', 'text': 'Provided caption: a blue bicycle.'},
+        image_part(),
+    ]
+    result = client.post('/v1/memories/add', json=add_payload(content=content))
+    assert result.status_code == 200
+    assert not backend.caption_inputs
+    assert any(
+        'Provided caption: a blue bicycle.' in text for text in backend.embedding_inputs
+    )
+    assert not any('Visual description:' in text for text in backend.embedding_inputs)
+
+
+def test_query_caption_failure_does_not_silently_drop_visual_retrieval(client, backend):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    backend.fail_caption = True
+    before = len(backend.embedding_inputs)
+    response = client.post(
+        '/v1/memories/search',
+        json=search_payload(
+            query=[{'type': 'text', 'text': 'Find this'}, image_part()]
+        ),
+    )
+    assert response.status_code == 502
+    assert response.json() == {'error': 'vision_http_403'}
+    assert len(backend.embedding_inputs) == before
+    assert not backend.rerank_inputs
 
 
 def test_restart_preserves_memory_and_idempotence(settings):
@@ -678,9 +701,7 @@ def test_atm_sources_in_aml_envelope_preserve_evidence(client, backend, source_t
             assert row['content'].endswith(content)
         else:
             assert row['content'][1:] == content
-    assert len(backend.caption_inputs) == {'image': 1, 'video_frames': 2}.get(
-        source_type, 0
-    )
+    assert not backend.caption_inputs
 
 
 def test_raw_video_is_rejected_without_model_calls(client, backend):
@@ -980,6 +1001,180 @@ def test_single_rerank_failure_does_not_return_unranked_or_duplicate_sources(
     assert response.status_code == 502
     assert response.json() == {'error': 'rerank_http_429'}
     assert len(backend.rerank_inputs) == 1
+
+
+def test_supplied_captions_stay_next_to_their_own_images(client, backend):
+    parts = [
+        {'type': 'text', 'text': 'Caption one: a red backpack.'},
+        image_part(image_url('red')),
+        {'type': 'text', 'text': 'Caption two: a blue bicycle.'},
+        image_part(image_url('blue')),
+    ]
+    assert (
+        client.post('/v1/memories/add', json=add_payload(content=parts)).status_code
+        == 200
+    )
+    assert not backend.caption_inputs
+    engine = client.app.state.engine
+    message = engine.store.messages('user-1', 'session-1')[0]
+    content = json.loads(message['content'])
+    red_marker = f"[Image img_{content[1]['hash'][:16]}]"
+    blue_marker = f"[Image img_{content[3]['hash'][:16]}]"
+    rendered = message['render']
+    assert rendered.index(parts[0]['text']) < rendered.index(red_marker)
+    assert rendered.index(red_marker) < rendered.index(parts[2]['text'])
+    assert rendered.index(parts[2]['text']) < rendered.index(blue_marker)
+    response = client.post(
+        '/v1/memories/search', json=search_payload(query='blue bicycle')
+    )
+    assert response.status_code == 200
+    assert response.json()['data'][0]['content'][1:] == parts
+    assert not backend.caption_inputs
+
+
+def test_query_and_image_caption_retrieve_separately_then_rerank_once(
+    client, backend, monkeypatch
+):
+    payload = add_payload()
+    payload['messages'] = [
+        {'role': 'user', 'content': f'Source {position}.'} for position in range(3)
+    ]
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    store = client.app.state.engine.store
+    messages = store.messages('user-1', 'session-1')
+    candidates = [
+        {
+            'chunk_id': f'chunk-{position}',
+            'score': 0.9 - position / 10,
+            'content': message['render'],
+            'source_ids': [message['message_id']],
+        }
+        for position, message in enumerate(messages)
+    ]
+    vectors = []
+
+    def retrieve(user, vector, count):
+        assert user == 'user-1' and count == 128
+        vectors.append(vector)
+        if vector[2] > vector[1]:
+            return [candidates[0], candidates[2]]
+        return [candidates[1], candidates[2]]
+
+    monkeypatch.setattr(store, 'candidates', retrieve)
+    before = len(backend.embedding_inputs)
+    question = 'Where was the blue item bought?'
+    response = client.post(
+        '/v1/memories/search',
+        json=search_payload(query=[{'type': 'text', 'text': question}, image_part()]),
+    )
+    assert response.status_code == 200
+    assert len(vectors) == 2
+    assert backend.embedding_inputs[before:] == [question, 'A red backpack.']
+    assert len(backend.caption_inputs) == 1
+    assert len(backend.rerank_inputs) == 1
+    rerank_query, merged = backend.rerank_inputs[0]
+    assert question in rerank_query and 'A red backpack.' in rerank_query
+    assert [row['chunk_id'] for row in merged] == ['chunk-2', 'chunk-0', 'chunk-1']
+    assert backend.rerank_limits == [3]
+    assert [row['id'] for row in response.json()['data']] == [
+        messages[position]['message_id'] for position in [2, 0, 1]
+    ]
+
+
+def test_image_only_query_uses_caption_without_an_empty_text_branch(client, backend):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    before = len(backend.embedding_inputs)
+    response = client.post(
+        '/v1/memories/search', json=search_payload(query=[image_part()])
+    )
+    assert response.status_code == 200
+    assert backend.embedding_inputs[before:] == ['A red backpack.']
+    assert len(backend.rerank_inputs) == 1
+
+
+def test_multiple_query_images_share_one_caption_branch(client, backend, monkeypatch):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    captions = iter(['A red backpack.', 'A blue bicycle.'])
+
+    async def caption(url, context):
+        backend.caption_inputs.append((url, context))
+        return next(captions)
+
+    backend.caption = caption
+    engine = client.app.state.engine
+    retrieve = engine.store.candidates
+    vectors = []
+
+    def search(user, vector, count):
+        vectors.append(vector)
+        return retrieve(user, vector, count)
+
+    monkeypatch.setattr(engine.store, 'candidates', search)
+    before = len(backend.embedding_inputs)
+    response = client.post(
+        '/v1/memories/search',
+        json=search_payload(
+            query=[
+                {'type': 'text', 'text': 'Compare these items'},
+                image_part(image_url('red')),
+                image_part(image_url('blue')),
+            ]
+        ),
+    )
+    assert response.status_code == 200
+    assert len(backend.caption_inputs) == 2
+    assert len(vectors) == 2
+    assert backend.embedding_inputs[before:] == [
+        'Compare these items',
+        'A red backpack.\nA blue bicycle.',
+    ]
+    assert len(backend.rerank_inputs) == 1
+
+
+def test_fusion_deduplicates_chunk_ids_and_caps_the_shared_pool(client):
+    engine = client.app.state.engine
+    first = [{'chunk_id': f'text-{position}'} for position in range(128)]
+    second = [{'chunk_id': f'caption-{position}'} for position in range(128)]
+    fused = engine._fuse_candidates([first, second])
+    assert len(fused) == 128
+    assert len({row['chunk_id'] for row in fused}) == 128
+    assert {row['chunk_id'] for row in fused[:2]} == {'text-0', 'caption-0'}
+    overlap = engine._fuse_candidates(
+        [[{'chunk_id': 'same'}, {'chunk_id': 'same'}], [{'chunk_id': 'other'}]]
+    )
+    assert [row['chunk_id'] for row in overlap] == ['same', 'other']
+    assert overlap[0]['score'] == pytest.approx(1 / 61)
+
+
+def test_empty_query_caption_fails_without_retrieval(client, backend):
+    assert client.post('/v1/memories/add', json=add_payload()).status_code == 200
+    original = backend.caption
+
+    async def caption(url, context):
+        return '   '
+
+    backend.caption = caption
+    before = len(backend.embedding_inputs)
+    response = client.post(
+        '/v1/memories/search', json=search_payload(query=[image_part()])
+    )
+    assert response.status_code == 502
+    assert response.json() == {'error': 'empty_query_image_caption'}
+    assert len(backend.embedding_inputs) == before
+    assert not backend.rerank_inputs
+    backend.caption = original
+    response = client.post(
+        '/v1/memories/search', json=search_payload(query=[image_part()])
+    )
+    assert response.status_code == 200
+    assert len(backend.rerank_inputs) == 1
+
+
+def test_new_caption_protocol_rejects_a_legacy_data_directory(settings):
+    store = Store(settings.data_dir, 'legacy-v1.1-generated-history-captions')
+    store.close()
+    with pytest.raises(ValueError, match='different model or configuration'):
+        Store(settings.data_dir, settings.identity())
 
 
 def test_over_capacity_returns_retry_after(settings):

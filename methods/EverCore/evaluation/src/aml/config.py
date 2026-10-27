@@ -85,7 +85,7 @@ class Settings:
             'rerank_proxy_url',
         ):
             values.pop(name)
-        values['protocol_version'] = 1
+        values['protocol_version'] = 2
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
