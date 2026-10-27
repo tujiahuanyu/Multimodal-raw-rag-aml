@@ -882,7 +882,7 @@ def test_single_chunk_rerank_determines_source_order_and_scores(
 
 
 @pytest.mark.parametrize('top_k', [1, 3, 15, 100])
-def test_message_dedup_backfills_beyond_fifteenth_ranked_chunk(
+def test_first_fifteen_chunks_bound_anchors_before_message_dedup(
     client, backend, monkeypatch, top_k
 ):
     payload = add_payload()
@@ -916,14 +916,12 @@ def test_message_dedup_backfills_beyond_fifteenth_ranked_chunk(
     assert len(backend.rerank_inputs) == 1
     assert backend.rerank_limits == [34]
     evidence = response.json()['data']
-    expected = min(top_k, 15)
+    expected = 1
     assert len(evidence) == expected
     assert [row['id'] for row in evidence] == [
         row['message_id'] for row in messages[:expected]
     ]
     assert evidence[0]['score'] == 1
-    if expected > 1:
-        assert evidence[1]['score'] == 1 - 20 / len(candidates)
     assert all(
         row['content'].endswith(original['content'])
         for row, original in zip(evidence, payload['messages'])
@@ -958,7 +956,7 @@ def test_message_dedup_backfills_after_over_budget_source(settings, monkeypatch)
         first = engine.store.messages('user-1', 'session-1')[0]
         second = engine.store.messages('user-1', 'second')[0]
         monkeypatch.setattr(
-            engine, 'settings', replace(settings, result_count=1, max_media_bytes=size)
+            engine, 'settings', replace(settings, max_media_bytes=size)
         )
         monkeypatch.setattr(
             engine.store,

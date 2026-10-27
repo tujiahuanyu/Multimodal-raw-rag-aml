@@ -239,8 +239,15 @@ class Engine:
             )
             for row, vector in zip(chunks, vectors):
                 row['vector'] = vector
-            return self.store.commit(
-                request, payload_hash, added, chunks, media, image_views
+            return await asyncio.to_thread(
+                self.store.commit,
+                request,
+                payload_hash,
+                added,
+                chunks,
+                media,
+                image_views,
+                self.settings.association_count,
             )
 
     def _chunks(self, user, session, messages):
@@ -322,10 +329,17 @@ class Engine:
             ranked_chunks = await self.providers.rerank(
                 rerank_query, candidates, len(candidates)
             )
-            limit = min(request.top_k, self.settings.result_count)
+            anchors = ranked_chunks[: self.settings.result_count]
+            neighbors = await asyncio.to_thread(
+                self.store.associated,
+                request.user_id,
+                anchors,
+                self.settings.association_expand_count,
+            )
+            limit = request.top_k
             output = []
             total_media = 0
-            for candidate in self._message_candidates(ranked_chunks):
+            for candidate in self._message_candidates([*anchors, *neighbors]):
                 result, image_bytes = self._evidence(request.user_id, candidate)
                 if total_media + image_bytes > self.settings.max_media_bytes:
                     continue
