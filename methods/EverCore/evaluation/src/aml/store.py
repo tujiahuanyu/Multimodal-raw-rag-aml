@@ -48,8 +48,6 @@ class Store:
                     CREATE INDEX IF NOT EXISTS chunks_user ON chunks(user_id);
                     CREATE TABLE IF NOT EXISTS image_views (view_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_id TEXT NOT NULL, message_id TEXT NOT NULL, image_hash TEXT NOT NULL, kind TEXT NOT NULL, ordinal INTEGER NOT NULL, content TEXT NOT NULL, vector BLOB NOT NULL, dimensions INTEGER NOT NULL);
                     CREATE INDEX IF NOT EXISTS image_views_user ON image_views(user_id,message_id,image_hash,ordinal);
-                    CREATE TABLE IF NOT EXISTS chunk_links (user_id TEXT, source_id TEXT, target_id TEXT, similarity REAL NOT NULL, target_source_ids TEXT NOT NULL, PRIMARY KEY(user_id,source_id,target_id));
-                    CREATE INDEX IF NOT EXISTS chunk_links_target ON chunk_links(user_id,target_id);
                     CREATE TABLE IF NOT EXISTS media (user_id TEXT, hash TEXT, mime TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(user_id,hash));
                     CREATE TABLE IF NOT EXISTS captions (user_id TEXT, hash TEXT, text TEXT NOT NULL, PRIMARY KEY(user_id,hash));
                     CREATE TABLE IF NOT EXISTS embeddings (user_id TEXT, hash TEXT, vector BLOB NOT NULL, dimensions INTEGER NOT NULL, PRIMARY KEY(user_id,hash));
@@ -151,11 +149,7 @@ class Store:
             ).fetchone()
         return np.frombuffer(row['vector'], dtype='<f4').copy() if row else None
 
-    def commit(
-        self, request, payload_hash, messages, chunks, media, image_views=(), association_count=5
-    ):
-        from .associations import refresh_links
-
+    def commit(self, request, payload_hash, messages, chunks, media, image_views=()):
         response = {
             'success': True,
             'request_id': request.request_id,
@@ -165,13 +159,6 @@ class Store:
         with self.connection() as connection:
             connection.execute('BEGIN IMMEDIATE')
             try:
-                previous_chunks = {
-                    row[0]
-                    for row in connection.execute(
-                        'SELECT chunk_id FROM chunks WHERE user_id=? AND session_id=?',
-                        (request.user_id, request.session_id),
-                    )
-                }
                 for row in messages:
                     connection.execute(
                         'INSERT INTO messages VALUES (?,?,?,?,?,?,?,?)',
@@ -232,16 +219,6 @@ class Store:
                         for row in image_views
                     ],
                 )
-                new_identifiers = {
-                    row['chunk_id'] for row in chunks
-                } - previous_chunks
-                new_identifiers.update(
-                    digest(('image', request.user_id, row['message_id'], row['image_hash']))
-                    for row in image_views
-                )
-                refresh_links(
-                    connection, request.user_id, new_identifiers, association_count
-                )
                 connection.execute(
                     'INSERT INTO requests (user_id,request_id,payload_hash,response) VALUES (?,?,?,?)',
                     (
@@ -256,37 +233,6 @@ class Store:
                 connection.rollback()
                 raise
         return response
-
-    def associated(self, user, anchors, count):
-        if not anchors:
-            return []
-        anchor_ids = {row['chunk_id'] for row in anchors}
-        floor = min(row['score'] for row in anchors)
-        neighbors = {}
-        with self.connection() as connection:
-            for anchor in anchors:
-                rows = connection.execute(
-                    'SELECT target_id,similarity,target_source_ids FROM chunk_links '
-                    'WHERE user_id=? AND source_id=? ORDER BY similarity DESC,target_id DESC LIMIT ?',
-                    (user, anchor['chunk_id'], count),
-                )
-                for row in rows:
-                    identifier = row['target_id']
-                    if identifier in anchor_ids:
-                        continue
-                    similarity = float(row['similarity'])
-                    score = min(floor, anchor['score'] * max(0.0, min(1.0, similarity)))
-                    if identifier not in neighbors or score > neighbors[identifier]['score']:
-                        neighbors[identifier] = {
-                            'chunk_id': identifier,
-                            'source_ids': json.loads(row['target_source_ids']),
-                            'score': score,
-                            'association_similarity': similarity,
-                        }
-        return sorted(
-            neighbors.values(),
-            key=lambda row: (-row['score'], -row['association_similarity'], row['chunk_id']),
-        )
 
     def candidates(self, user, vector, count):
         selected = []
@@ -390,7 +336,6 @@ class Store:
             connection.execute('BEGIN IMMEDIATE')
             try:
                 for table in [
-                    'chunk_links',
                     'requests',
                     'messages',
                     'chunks',

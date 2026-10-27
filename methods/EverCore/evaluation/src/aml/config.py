@@ -26,8 +26,6 @@ class Settings:
     chunk_overlap: int = 32
     candidate_count: int = 128
     result_count: int = 15
-    association_count: int = 5
-    association_expand_count: int = 2
     embedding_batch: int = 10
     concurrency: int = 2
     max_body_bytes: int = 128 * 1024 * 1024
@@ -73,12 +71,6 @@ class Settings:
             raise ValueError('Invalid window size or overlap')
         if not 1 <= self.result_count <= self.candidate_count:
             raise ValueError('Invalid retrieval counts')
-        if (
-            type(self.association_count) is not int
-            or type(self.association_expand_count) is not int
-            or not 1 <= self.association_expand_count <= self.association_count <= 32
-        ):
-            raise ValueError('Invalid association counts')
         if not 1 <= self.embedding_batch <= 10 or self.concurrency < 1:
             raise ValueError('Invalid batch size or concurrency')
 
@@ -93,7 +85,7 @@ class Settings:
             'rerank_proxy_url',
         ):
             values.pop(name)
-        values['protocol_version'] = 5
+        values['protocol_version'] = 3
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
 
