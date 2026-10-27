@@ -17,6 +17,9 @@
 - 新增 SQLite 持久化、幂等写入、访问认证及媒体校验。
 - 当前代码为 `v1.3`，不沿用历史版本成绩；实际部署版本以 `/health` 为准。图片多描述及噪声控制见 [v1.3 说明](methods/EverCore/evaluation/docs/MULTI_VIEW_IMAGE_RETRIEVAL_ZH.md)。双路查询基础见 [v1.2 说明](methods/EverCore/evaluation/docs/PROVIDED_CAPTION_DUAL_QUERY_ZH.md)。ATM 来源兼容范围及消息去重规则见 [核查说明](methods/EverCore/evaluation/docs/ATM_AND_MESSAGE_DEDUP_ZH.md)。
 
+2026-10-27 已发布 v1.3：本地 190 项回归、云端 119 项回归及外网官方样例 32 项检查通过。
+使用全新索引，旧版保留；样例自测不等于平台正式 Smoke，公开 6 题对照也未显示召回提升。
+
 ## 部署
 
 需要 Linux、Python 3.10+。默认通过外部 API 调用模型，无需在接口服务器加载大模型。
