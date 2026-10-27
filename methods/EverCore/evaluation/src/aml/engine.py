@@ -322,7 +322,7 @@ class Engine:
             ranked_chunks = await self.providers.rerank(
                 rerank_query, candidates, len(candidates)
             )
-            limit = request.top_k
+            limit = min(request.top_k, self.settings.result_count)
             output = []
             total_media = 0
             for candidate in self._message_candidates(ranked_chunks):

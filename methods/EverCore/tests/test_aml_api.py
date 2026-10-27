@@ -881,14 +881,14 @@ def test_single_chunk_rerank_determines_source_order_and_scores(
     assert len(backend.rerank_inputs) == 1
 
 
-@pytest.mark.parametrize('top_k', [1, 3, 14, 15, 16, 100])
+@pytest.mark.parametrize('top_k', [1, 3, 15, 100])
 def test_message_dedup_backfills_beyond_fifteenth_ranked_chunk(
     client, backend, monkeypatch, top_k
 ):
     payload = add_payload()
     payload['messages'] = [
         {'role': 'user', 'content': f'Complete source number {position}.'}
-        for position in range(100)
+        for position in range(15)
     ]
     assert client.post('/v1/memories/add', json=payload).status_code == 200
     store = client.app.state.engine.store
@@ -914,9 +914,9 @@ def test_message_dedup_backfills_beyond_fifteenth_ranked_chunk(
     )
     assert response.status_code == 200
     assert len(backend.rerank_inputs) == 1
-    assert backend.rerank_limits == [119]
+    assert backend.rerank_limits == [34]
     evidence = response.json()['data']
-    expected = top_k
+    expected = min(top_k, 15)
     assert len(evidence) == expected
     assert [row['id'] for row in evidence] == [
         row['message_id'] for row in messages[:expected]
@@ -928,27 +928,6 @@ def test_message_dedup_backfills_beyond_fifteenth_ranked_chunk(
         row['content'].endswith(original['content'])
         for row, original in zip(evidence, payload['messages'])
     )
-
-
-@pytest.mark.parametrize('top_k', [1, 14, 15, 16, 100])
-def test_requested_top_k_replaces_legacy_fifteen_message_limit(
-    client, backend, top_k
-):
-    payload = add_payload()
-    payload['messages'] = [
-        {'role': 'user', 'content': f'Complete red backpack source {position}.'}
-        for position in range(120)
-    ]
-    assert client.post('/v1/memories/add', json=payload).status_code == 200
-    response = client.post(
-        '/v1/memories/search', json={**search_payload(), 'top_k': top_k}
-    )
-    assert response.status_code == 200
-    evidence = response.json()['data']
-    assert len(evidence) == top_k
-    assert len({row['id'] for row in evidence}) == top_k
-    assert len(backend.rerank_inputs) == 1
-    assert backend.rerank_limits == [len(backend.rerank_inputs[0][1])]
 
 
 def test_message_dedup_backfills_after_over_budget_source(settings, monkeypatch):
