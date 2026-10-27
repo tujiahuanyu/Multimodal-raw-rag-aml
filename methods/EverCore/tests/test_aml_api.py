@@ -1423,33 +1423,47 @@ def test_new_caption_protocol_rejects_a_legacy_data_directory(settings):
         Store(settings.data_dir, settings.identity())
 
 
-def test_over_capacity_returns_retry_after(settings):
+@pytest.mark.parametrize('concurrency,request_count', [(1, 4), (2, 16)])
+def test_over_capacity_queues_until_writes_complete(
+    settings, concurrency, request_count
+):
     import asyncio
     from concurrent.futures import ThreadPoolExecutor
     from threading import Barrier
 
     backend = FakeProviders()
     original = backend.embed
+    active = 0
+    peak = 0
 
     async def delayed(texts):
-        await asyncio.sleep(0.3)
-        return await original(texts)
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        try:
+            await asyncio.sleep(0.1)
+            return await original(texts)
+        finally:
+            active -= 1
 
     backend.embed = delayed
-    barrier = Barrier(3)
-    with TestClient(create_app(settings, backend)) as client:
+    barrier = Barrier(request_count)
+    application = create_app(replace(settings, concurrency=concurrency), backend)
+    with TestClient(application) as client:
         client.headers['Authorization'] = 'Token ' + settings.api_token
 
         def send(position):
             barrier.wait(timeout=5)
             return client.post('/v1/memories/add', json=add_payload(user=str(position)))
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            responses = list(executor.map(send, range(3)))
-        assert sorted(response.status_code for response in responses) == [200, 200, 429]
-        assert (
-            next(
-                response for response in responses if response.status_code == 429
-            ).headers['Retry-After']
-            == '1'
-        )
+        with ThreadPoolExecutor(max_workers=request_count) as executor:
+            responses = list(executor.map(send, range(request_count)))
+        assert [response.status_code for response in responses] == [200] * request_count
+        assert all(response.json()['success'] for response in responses)
+        assert peak == concurrency
+        assert active == 0
+        with client.app.state.engine.store.connection() as connection:
+            assert (
+                connection.execute('SELECT count(*) FROM requests').fetchone()[0]
+                == request_count
+            )

@@ -91,7 +91,9 @@ v1.2 或更早版本的数据库或已有 Full 运行状态。服务会拒绝旧
 
 - 图片支持 JPEG、PNG、WebP；单图解码后不超过 10 MiB。
 - 单次 Add 和单次 Search 响应的媒体总量各不超过 30 MiB；请求体最大 128 MiB。
-- 默认并发 2，容量不足返回 429；每个数据目录仅允许一个服务进程。
+- Add/Search 共享实际处理并发 2；超出名额的已认证请求先排队，取得名额后才读取请求体，不因入口繁忙立即返回 429。每个数据目录仅允许一个服务进程。
+- 平台建议 Add/Search 并发各设为 1；无法调整平台并发时，服务端仍最多同时处理 2 个请求。排队会增加响应时间，仍受平台及网关的 30 分钟单请求超时限制，不保证任意规模并发均可完成。
+- 此入站排队修复不改变 v1.3 的检索、模型、索引身份或返回数量，已有同配置数据目录可继续使用；Full 故障修复应保留变更记录，并使用平台允许的原任务断点恢复。
 - 不记录原始 API 请求正文；按赛事要求安排数据清理。
 - 停止服务后，可使用 `python -m evaluation.src.aml purge-user --env-file .env.aml --data-dir <目录> --user-id <用户>` 删除指定用户数据。
 
@@ -101,7 +103,7 @@ v1.2 或更早版本的数据库或已有 Full 运行状态。服务会拒绝旧
 
 ```bash
 pip install pytest pytest-asyncio
-python -m pytest tests/test_aml_api.py tests/test_aml_smoke.py -q
+python -m pytest tests/test_aml_api.py tests/test_aml_gate.py tests/test_aml_smoke.py -q
 ```
 
 官方文档样例自测与已知缺口见 [接入复查记录](methods/EverCore/evaluation/docs/AML_AUDIT_20261026_ZH.md)；自测不等于平台正式 Smoke。

@@ -35,16 +35,8 @@ class Gate:
             return
         acquired = False
         try:
-            try:
-                await asyncio.wait_for(self.capacity.acquire(), timeout=0.05)
-                acquired = True
-            except asyncio.TimeoutError:
-                await JSONResponse(
-                    {'error': 'capacity_exceeded'},
-                    status_code=429,
-                    headers={'Retry-After': '1'},
-                )(scope, receive, send)
-                return
+            await self.capacity.acquire()
+            acquired = True
             try:
                 length = int(headers.get(b'content-length', b'0'))
                 if length < 0:
