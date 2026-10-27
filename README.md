@@ -6,6 +6,10 @@
 原方法与论文作者归上游项目所有；本仓库并非原作者官方发布的比赛服务。
 原作者、论文及逐项方法改动见 [来源披露](methods/EverCore/evaluation/docs/METHOD_DISCLOSURE_ZH.md)。
 
+## 说明
+
+提交比赛所用方法中的gpt-4o-mini来自中转站https://yinli.one
+
 ## 方法
 
 - 原始历史切片和图片描述索引 → 向量召回 → 一次候选重排（保留全部候选排序）→ 展开完整原始消息 → 按消息 ID 去重 → 取前 15 条来源消息，返回原始文字与图片；Search 不生成最终答案。
@@ -17,8 +21,6 @@
 - 新增 SQLite 持久化、幂等写入、访问认证及媒体校验。
 - 当前代码为 `v1.3`，不沿用历史版本成绩；实际部署版本以 `/health` 为准。图片多描述及噪声控制见 [v1.3 说明](methods/EverCore/evaluation/docs/MULTI_VIEW_IMAGE_RETRIEVAL_ZH.md)。双路查询基础见 [v1.2 说明](methods/EverCore/evaluation/docs/PROVIDED_CAPTION_DUAL_QUERY_ZH.md)。ATM 来源兼容范围及消息去重规则见 [核查说明](methods/EverCore/evaluation/docs/ATM_AND_MESSAGE_DEDUP_ZH.md)。
 
-2026-10-27 已发布 v1.3：本地 190 项回归、云端 119 项回归及外网官方样例 32 项检查通过。
-使用全新索引，旧版保留；样例自测不等于平台正式 Smoke，公开 6 题对照也未显示召回提升。
 
 ## 部署
 
