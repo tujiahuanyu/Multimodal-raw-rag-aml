@@ -6,9 +6,7 @@
 原方法与论文作者归上游项目所有；本仓库并非原作者官方发布的比赛服务。
 原作者、论文及逐项方法改动见 [来源披露](methods/EverCore/evaluation/docs/METHOD_DISCLOSURE_ZH.md)。
 
-## 说明
 
-提交比赛所用方法中的gpt-4o-mini来自中转站https://yinli.one
 
 ## 方法
 
@@ -107,3 +105,8 @@ python -m pytest tests/test_aml_api.py tests/test_aml_gate.py tests/test_aml_smo
 ```
 
 官方文档样例自测与已知缺口见 [接入复查记录](methods/EverCore/evaluation/docs/AML_AUDIT_20261026_ZH.md)；自测不等于平台正式 Smoke。
+
+
+## 说明
+
+提交比赛所用方法中的gpt-4o-mini来自中转站https://yinli.one
