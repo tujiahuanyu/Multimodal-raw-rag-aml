@@ -1,5 +1,6 @@
 import base64
-from dataclasses import replace
+from dataclasses import asdict, replace
+import hashlib
 import io
 import json
 
@@ -542,6 +543,36 @@ def test_rerank_proxy_rejects_invalid_configuration(settings, proxy_url):
 def test_rerank_proxy_does_not_change_index_identity(settings):
     proxied = replace(settings, rerank_proxy_url='http://127.0.0.1:47897')
     assert proxied.identity() == settings.identity()
+
+
+def test_default_shared_concurrency_is_sixteen(settings):
+    assert settings.concurrency == 16
+
+
+@pytest.mark.parametrize('concurrency', [1, 2, 16, 32])
+def test_concurrency_preserves_legacy_v13_index(settings, concurrency):
+    legacy = asdict(replace(settings, concurrency=2))
+    for name in (
+        'data_dir', 'api_token', 'vision_key', 'embedding_key', 'rerank_key',
+        'rerank_proxy_url',
+    ):
+        legacy.pop(name)
+    legacy['protocol_version'] = 3
+    legacy_identity = hashlib.sha256(
+        json.dumps(legacy, sort_keys=True).encode()
+    ).hexdigest()
+    configured = replace(settings, concurrency=concurrency)
+    assert configured.identity() == legacy_identity
+    store = Store(settings.data_dir, legacy_identity)
+    store.close()
+    reopened = Store(settings.data_dir, configured.identity())
+    with reopened.connection() as connection:
+        assert connection.execute(
+            "SELECT value FROM metadata WHERE key='identity'"
+        ).fetchone()[0] == legacy_identity
+    reopened.close()
+    assert replace(configured, chunk_size=512).identity() != legacy_identity
+    assert replace(configured, rerank_model='different-model').identity() != legacy_identity
 
 
 @pytest.mark.asyncio
@@ -1423,7 +1454,7 @@ def test_new_caption_protocol_rejects_a_legacy_data_directory(settings):
         Store(settings.data_dir, settings.identity())
 
 
-@pytest.mark.parametrize('concurrency,request_count', [(1, 4), (2, 16)])
+@pytest.mark.parametrize('concurrency,request_count', [(1, 4), (2, 16), (16, 32)])
 def test_over_capacity_queues_until_writes_complete(
     settings, concurrency, request_count
 ):

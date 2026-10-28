@@ -27,7 +27,7 @@ class Settings:
     candidate_count: int = 128
     result_count: int = 15
     embedding_batch: int = 10
-    concurrency: int = 2
+    concurrency: int = 16
     max_body_bytes: int = 128 * 1024 * 1024
     max_image_bytes: int = 10 * 1024 * 1024
     max_media_bytes: int = 30 * 1024 * 1024
@@ -85,6 +85,7 @@ class Settings:
             'rerank_proxy_url',
         ):
             values.pop(name)
+        values['concurrency'] = 2
         values['protocol_version'] = 3
         return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
 
