@@ -5,6 +5,8 @@ import math
 import httpx
 import numpy as np
 
+from .diagnostics import image_details_failure, vision_response, vision_transport_failure
+
 
 class ServiceError(Exception):
     def __init__(self, status: int, code: str):
@@ -14,7 +16,7 @@ class ServiceError(Exception):
 
 
 def image_descriptions(value):
-    if not isinstance(value, list) or len(value) > 4:
+    if not isinstance(value, list):
         raise ServiceError(502, 'vision_invalid_image_details')
     descriptions = []
     seen = set()
@@ -26,7 +28,7 @@ def image_descriptions(value):
         if normalized not in seen:
             descriptions.append(text)
             seen.add(normalized)
-    return descriptions
+    return descriptions[:4]
 
 
 class Providers:
@@ -59,11 +61,15 @@ class Providers:
                 response = await client.post(
                     url, headers={'Authorization': 'Bearer ' + key}, json=payload
                 )
-            except httpx.HTTPError:
+            except httpx.HTTPError as error:
+                if name == 'vision':
+                    vision_transport_failure(attempt + 1, error)
                 if attempt == 0:
                     await asyncio.sleep(1)
                     continue
                 raise ServiceError(502, name + '_connection_failed') from None
+            if name == 'vision' and not response.is_success:
+                vision_response(response, attempt + 1, payload.get('max_tokens'))
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt == 0:
                     await asyncio.sleep(1)
@@ -71,9 +77,14 @@ class Providers:
             if not response.is_success:
                 raise ServiceError(502, f'{name}_http_{response.status_code}')
             try:
-                return response.json()
+                data = response.json()
             except ValueError:
+                if name == 'vision':
+                    vision_response(response, attempt + 1, payload.get('max_tokens'))
                 raise ServiceError(502, name + '_invalid_json') from None
+            if name == 'vision':
+                vision_response(response, attempt + 1, payload.get('max_tokens'), data)
+            return data
 
     async def caption(self, url: str, context: str) -> str:
         settings = self.settings
@@ -163,7 +174,11 @@ class Providers:
                 raise ValueError
             result = json.loads(choice['message']['content'])
             return image_descriptions(result['descriptions'])
+        except ServiceError:
+            image_details_failure(data, url, self.settings.api_token)
+            raise
         except (KeyError, IndexError, TypeError, ValueError):
+            image_details_failure(data, url, self.settings.api_token)
             raise ServiceError(502, 'vision_invalid_image_details') from None
 
     async def embed(self, texts):

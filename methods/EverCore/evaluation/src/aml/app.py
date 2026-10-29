@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .contracts import AddRequest, SearchRequest
+from .diagnostics import add_trace
 from .engine import Engine
 from .providers import Providers, ServiceError
 from .store import Store
@@ -127,7 +128,8 @@ def create_app(settings, providers=None):
 
     @app.post('/v1/memories/add')
     async def add(payload: AddRequest):
-        return await app.state.engine.add(payload)
+        with add_trace(payload.user_id, payload.request_id, settings.api_token):
+            return await app.state.engine.add(payload)
 
     @app.post('/v1/memories/search')
     async def search(payload: SearchRequest):

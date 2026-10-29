@@ -1405,7 +1405,8 @@ def test_empty_or_duplicate_generated_descriptions_are_bounded(
         ({'descriptions': [None]}, 'stop', False),
         ({'descriptions': ['']}, 'stop', False),
         ({'descriptions': ['x' * 1201]}, 'stop', False),
-        ({'descriptions': ['one', 'two', 'three', 'four', 'five']}, 'stop', False),
+        ({'descriptions': ['one', 'two', 'three', 'four', 'five']}, 'stop', True),
+        ({'descriptions': ['one', 'two', 'three', 'four', None]}, 'stop', False),
         ('not json', 'stop', False),
     ],
 )
@@ -1445,6 +1446,40 @@ async def test_image_details_provider_validates_grounded_multi_view_json(
         assert recorded[0]['messages'][1]['content'][1]['image_url']['detail'] == 'high'
     finally:
         await provider.close()
+
+
+def test_excess_image_details_keep_four_unique_views_and_original_content(client, backend):
+    descriptions = [
+        'Red straps.', ' RED  STRAPS. ', 'Blue buckles.', 'BLUE BUCKLES.',
+        'A front pocket.', 'A small label.', 'A zipper.', 'A handle.', 'A shadow.',
+    ]
+    expected = ['Red straps.', 'Blue buckles.', 'A front pocket.', 'A small label.']
+
+    async def details(url):
+        backend.detail_inputs.append(url)
+        return descriptions
+
+    backend.image_details = details
+    original = [{'type': 'text', 'text': 'Supplied caption.'}, image_part()]
+    payload = add_payload(content=original)
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    store = client.app.state.engine.store
+    with store.connection() as connection:
+        rows = [dict(row) for row in connection.execute('SELECT * FROM image_views ORDER BY ordinal')]
+        cached = connection.execute('SELECT text FROM captions').fetchall()
+        assert connection.execute('SELECT count(*) FROM requests').fetchone()[0] == 1
+        assert connection.execute('SELECT count(*) FROM messages').fetchone()[0] == 1
+        assert connection.execute('SELECT count(*) FROM media').fetchone()[0] == 1
+    assert [row['kind'] for row in rows] == ['provided'] + ['generated'] * 4
+    assert [row['content'].split('\n', 1)[1] for row in rows] == ['Supplied caption.'] + expected
+    assert len(cached) == 1 and json.loads(cached[0]['text']) == expected
+    before = list(backend.embedding_inputs)
+    assert client.post('/v1/memories/add', json=payload).status_code == 200
+    assert backend.detail_inputs == [original[1]['image_url']['url']]
+    assert backend.embedding_inputs == before
+    result = client.post('/v1/memories/search', json=search_payload()).json()['data']
+    assert len(result) == 1 and result[0]['content'][1:] == original
+    assert len(backend.rerank_inputs) == 1
 
 
 def test_new_caption_protocol_rejects_a_legacy_data_directory(settings):
