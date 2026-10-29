@@ -1,5 +1,7 @@
 # Multimodal Raw-RAG AML
 
+**本次比赛最终使用的代码版本为 [`v1.3-stable`](https://github.com/tujiahuanyu/Multimodal-raw-rag-aml/tree/v1.3-stable)，对应比赛平台上的 `v1.0`。** `v1.0` 为平台登记的版本名称。
+
 面向 Agent Memory Leaderboard Add/Search 契约的多模态 Raw-RAG 适配。
 本仓库派生自 [Litmeb/RAW-RAG](https://github.com/Litmeb/RAW-RAG)，上游基线提交为
 `95639191e9547219b426710e50fe1a36235e26fc`，保留原项目 LICENSE。
@@ -109,4 +111,4 @@ python -m pytest tests/test_aml_api.py tests/test_aml_gate.py tests/test_aml_smo
 
 ## 说明
 
-提交比赛所用方法中的gpt-4o-mini来自中转站https://yinli.one
+比赛所用方法中的 `gpt-4o-mini` 通过第三方 API 中转服务 [yinli.one](https://yinli.one) 调用。
